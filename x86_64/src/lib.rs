@@ -5,6 +5,8 @@
 mod fdt;
 
 const E820_RAM: u32 = 1;
+const E820_RESERVED: u32 = 2;
+
 const SETUP_DTB: u32 = 2;
 const X86_64_FDT_MAX_SIZE: u64 = 0x200000;
 
@@ -60,8 +62,8 @@ use arch::{
 use base::Event;
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
-    BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciDevice,
-    ProtectionType,
+    BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciConfigMmio,
+    PciDevice, ProtectionType,
 };
 use hypervisor::{HypervisorX86_64, VcpuX86_64, VmX86_64};
 use minijail::Minijail;
@@ -192,16 +194,21 @@ const BOOT_STACK_POINTER: u64 = 0x8000;
 // Make sure it align to 256MB for MTRR convenient
 const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
+// Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
+const RESERVED_MEM_SIZE: u64 = 0x800_0000;
+// Reserve 64MB for pcie enhanced configuration
+const PCIE_CFG_MMIO_SIZE: u64 = 0x400_0000;
+const PCIE_CFG_MMIO_START: u64 = FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE;
 const END_ADDR_BEFORE_32BITS: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
-const MMIO_SIZE: u64 = MEM_32BIT_GAP_SIZE - 0x8000000;
+const PCI_MMIO_SIZE: u64 = MEM_32BIT_GAP_SIZE - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE;
 // Linux (with 4-level paging) has a physical memory limit of 46 bits (64 TiB).
 const HIGH_MMIO_MAX_END: u64 = 1u64 << 46;
 const KERNEL_64BIT_ENTRY_OFFSET: u64 = 0x200;
 const ZERO_PAGE_OFFSET: u64 = 0x7000;
-const TSS_ADDR: u64 = 0xfffbd000;
+const TSS_ADDR: u64 = 0xfffb_d000;
 
-const KERNEL_START_OFFSET: u64 = 0x200000;
-const CMDLINE_OFFSET: u64 = 0x20000;
+const KERNEL_START_OFFSET: u64 = 0x20_0000;
+const CMDLINE_OFFSET: u64 = 0x2_0000;
 const CMDLINE_MAX_SIZE: u64 = KERNEL_START_OFFSET - CMDLINE_OFFSET;
 const X86_64_SERIAL_1_3_IRQ: u32 = 4;
 const X86_64_SERIAL_2_4_IRQ: u32 = 3;
@@ -214,11 +221,11 @@ const X86_64_SERIAL_2_4_IRQ: u32 = 3;
 pub const X86_64_SCI_IRQ: u32 = 5;
 // The CMOS RTC uses IRQ 8; start allocating IRQs at 9.
 pub const X86_64_IRQ_BASE: u32 = 9;
-const ACPI_HI_RSDP_WINDOW_BASE: u64 = 0x000E0000;
+const ACPI_HI_RSDP_WINDOW_BASE: u64 = 0x000E_0000;
 
 /// The x86 reset vector for i386+ and x86_64 puts the processor into an "unreal mode" where it
 /// can access the last 1 MB of the 32-bit address space in 16-bit mode, and starts the instruction
-/// pointer at the effective physical address 0xFFFFFFF0.
+/// pointer at the effective physical address 0xFFFF_FFF0.
 fn bios_start(bios_size: u64) -> GuestAddress {
     GuestAddress(FIRST_ADDR_PAST_32BITS - bios_size)
 }
@@ -233,11 +240,11 @@ fn configure_system(
     initrd: Option<(GuestAddress, usize)>,
     mut params: boot_params,
 ) -> Result<()> {
-    const EBDA_START: u64 = 0x0009fc00;
+    const EBDA_START: u64 = 0x0009_fc00;
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
-    const KERNEL_HDR_MAGIC: u32 = 0x53726448;
+    const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
     const KERNEL_LOADER_OTHER: u8 = 0xff;
-    const KERNEL_MIN_ALIGNMENT_BYTES: u32 = 0x1000000; // Must be non-zero.
+    const KERNEL_MIN_ALIGNMENT_BYTES: u32 = 0x100_0000; // Must be non-zero.
     let first_addr_past_32bits = GuestAddress(FIRST_ADDR_PAST_32BITS);
     let end_32bit_gap_start = GuestAddress(END_ADDR_BEFORE_32BITS);
 
@@ -281,6 +288,13 @@ fn configure_system(
             )?;
         }
     }
+
+    add_e820_entry(
+        &mut params,
+        PCIE_CFG_MMIO_START,
+        PCIE_CFG_MMIO_SIZE,
+        E820_RESERVED,
+    )?;
 
     let zero_page_addr = GuestAddress(ZERO_PAGE_OFFSET);
     guest_mem
@@ -359,7 +373,7 @@ impl arch::LinuxArch for X8664arch {
         let high_mmio_size = Self::get_high_mmio_size(guest_mem);
         SystemAllocator::builder()
             .add_io_addresses(0xc000, 0x10000)
-            .add_low_mmio_addresses(END_ADDR_BEFORE_32BITS, MMIO_SIZE)
+            .add_low_mmio_addresses(END_ADDR_BEFORE_32BITS, PCI_MMIO_SIZE)
             .add_high_mmio_addresses(high_mmio_start, high_mmio_size)
             .create_allocator(X86_64_IRQ_BASE)
             .unwrap()
@@ -368,6 +382,7 @@ impl arch::LinuxArch for X8664arch {
     fn build_vm<V, Vcpu>(
         mut components: VmComponents,
         exit_evt: &Event,
+        reset_evt: &Event,
         system_allocator: &mut SystemAllocator,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
@@ -415,8 +430,20 @@ impl arch::LinuxArch for X8664arch {
             4, // Share the four pin interrupts (INTx#)
         )
         .map_err(Error::CreatePciRoot)?;
-        let pci_bus = Arc::new(Mutex::new(PciConfigIo::new(pci)));
-        io_bus.insert(pci_bus.clone(), 0xcf8, 0x8).unwrap();
+
+        let pci = Arc::new(Mutex::new(pci));
+        pci.lock().enable_pcie_cfg_mmio(PCIE_CFG_MMIO_START);
+        let pci_cfg = PciConfigIo::new(
+            pci.clone(),
+            reset_evt.try_clone().map_err(Error::CloneEvent)?,
+        );
+        let pci_bus = Arc::new(Mutex::new(pci_cfg));
+        io_bus.insert(pci_bus, 0xcf8, 0x8).unwrap();
+
+        let pcie_cfg_mmio = Arc::new(Mutex::new(PciConfigMmio::new(pci.clone(), 12)));
+        mmio_bus
+            .insert(pcie_cfg_mmio, PCIE_CFG_MMIO_START, PCIE_CFG_MMIO_SIZE)
+            .unwrap();
 
         // Event used to notify crosvm that guest OS is trying to suspend.
         let suspend_evt = Event::new().map_err(Error::CreateEvent)?;
@@ -425,7 +452,7 @@ impl arch::LinuxArch for X8664arch {
             Self::setup_legacy_devices(
                 &io_bus,
                 irq_chip.pit_uses_speaker_port(),
-                exit_evt.try_clone().map_err(Error::CloneEvent)?,
+                reset_evt.try_clone().map_err(Error::CloneEvent)?,
                 components.memory_size,
             )?;
         }
@@ -439,6 +466,9 @@ impl arch::LinuxArch for X8664arch {
 
         let mut resume_notify_devices = Vec::new();
 
+        // each bus occupy 1MB mmio for pcie enhanced configuration
+        let max_bus = ((PCIE_CFG_MMIO_SIZE / 0x100000) - 1) as u8;
+
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
             &mem,
             &io_bus,
@@ -449,17 +479,15 @@ impl arch::LinuxArch for X8664arch {
             irq_chip.as_irq_chip_mut(),
             battery,
             &mmio_bus,
+            max_bus,
             &mut resume_notify_devices,
         )?;
 
         // Use IRQ info in ACPI if provided by the user.
-        let mut noirq = true;
-
-        for sdt in acpi_dev_resource.sdts.iter() {
-            if sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC") {
-                noirq = false;
-            }
-        }
+        let noirq = !acpi_dev_resource
+            .sdts
+            .iter()
+            .any(|sdt| sdt.is_signature(b"DSDT") || sdt.is_signature(b"APIC"));
 
         irq_chip
             .finalize_devices(system_allocator, &io_bus, &mmio_bus)
@@ -474,7 +502,7 @@ impl arch::LinuxArch for X8664arch {
         // should be rethought.
 
         // Note that this puts the mptable at 0x9FC00 in guest physical memory.
-        mptable::setup_mptable(&mem, vcpu_count as u8, pci_irqs).map_err(Error::SetupMptable)?;
+        mptable::setup_mptable(&mem, vcpu_count as u8, &pci_irqs).map_err(Error::SetupMptable)?;
         smbios::setup_smbios(&mem, components.dmi_path).map_err(Error::SetupSmbios)?;
 
         let host_cpus = if components.host_cpu_topology {
@@ -488,9 +516,14 @@ impl arch::LinuxArch for X8664arch {
             &mem,
             vcpu_count as u8,
             X86_64_SCI_IRQ,
+            0xcf9,
+            6, // RST_CPU|SYS_RST
             acpi_dev_resource,
             host_cpus,
             kvm_vcpu_ids,
+            &pci_irqs,
+            PCIE_CFG_MMIO_START,
+            max_bus,
         )
         .ok_or(Error::CreateAcpi)?;
 
@@ -558,7 +591,7 @@ impl arch::LinuxArch for X8664arch {
             bat_control,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             gdb: components.gdb,
-            root_config: pci_bus,
+            root_config: pci,
             hotplug_bus: Vec::new(),
         })
     }
@@ -1011,9 +1044,7 @@ impl X8664arch {
         // pcie_ports=native is used to force enable pcie hotplug temporary.
         // Once pcie enhanced configuration access feature is enabled, _OSC
         // will be added, then this parameter will be removed.
-        cmdline
-            .insert_str("reboot=k panic=-1 pcie_ports=native")
-            .unwrap();
+        cmdline.insert_str("panic=-1 pcie_ports=native").unwrap();
 
         cmdline
     }
@@ -1024,12 +1055,12 @@ impl X8664arch {
     ///
     /// * - `io_bus` - the IO bus object
     /// * - `pit_uses_speaker_port` - does the PIT use port 0x61 for the PC speaker
-    /// * - `exit_evt` - the event object which should receive exit events
+    /// * - `reset_evt` - the event object which should receive exit events
     /// * - `mem_size` - the size in bytes of physical ram for the guest
     fn setup_legacy_devices(
         io_bus: &devices::Bus,
         pit_uses_speaker_port: bool,
-        exit_evt: Event,
+        reset_evt: Event,
         mem_size: u64,
     ) -> Result<()> {
         struct NoDevice;
@@ -1063,7 +1094,7 @@ impl X8664arch {
 
         let nul_device = Arc::new(Mutex::new(NoDevice));
         let i8042 = Arc::new(Mutex::new(devices::I8042Device::new(
-            exit_evt.try_clone().map_err(Error::CloneEvent)?,
+            reset_evt.try_clone().map_err(Error::CloneEvent)?,
         )));
 
         if pit_uses_speaker_port {
@@ -1101,6 +1132,7 @@ impl X8664arch {
         irq_chip: &mut dyn IrqChip,
         battery: (&Option<BatteryType>, Option<Minijail>),
         mmio_bus: &devices::Bus,
+        max_bus: u8,
         resume_notify_devices: &mut Vec<Arc<Mutex<dyn BusResumeDevice>>>,
     ) -> Result<(acpi::AcpiDevResource, Option<BatControl>)> {
         // The AML data for the acpi devices
@@ -1138,13 +1170,13 @@ impl X8664arch {
         let crs = aml::Name::new(
             "_CRS".into(),
             &aml::ResourceTemplate::new(vec![
-                &aml::AddressSpace::new_bus_number(0x0u16, 0xffu16),
+                &aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16),
                 &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
                 &aml::AddressSpace::new_memory(
                     aml::AddressSpaceCachable::NotCacheable,
                     true,
                     END_ADDR_BEFORE_32BITS as u32,
-                    (END_ADDR_BEFORE_32BITS + MMIO_SIZE - 1) as u32,
+                    (END_ADDR_BEFORE_32BITS + PCI_MMIO_SIZE - 1) as u32,
                 ),
                 &aml::AddressSpace::new_memory(
                     aml::AddressSpaceCachable::NotCacheable,

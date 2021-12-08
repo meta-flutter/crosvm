@@ -43,6 +43,8 @@ use devices::virtio::{
     },
     vhost::user::device::run_gpu_device,
 };
+#[cfg(feature = "direct")]
+use devices::BusRange;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
 use devices::{PciAddress, PciClassCode, ProtectionType, StubPciParameters};
@@ -460,10 +462,15 @@ fn parse_gpu_options(s: Option<&str>, gpu_params: &mut GpuParameters) -> argumen
 
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
-    const VALID_VIDEO_BACKENDS: &[&str] = &["libvda"];
+    const VALID_VIDEO_BACKENDS: &[&str] = &[
+        #[cfg(feature = "libvda")]
+        "libvda",
+    ];
 
     match s {
+        #[cfg(feature = "libvda")]
         None => Ok(VideoBackendType::Libvda),
+        #[cfg(feature = "libvda")]
         Some("libvda") => Ok(VideoBackendType::Libvda),
         Some(s) => Err(argument::Error::InvalidValue {
             value: s.to_owned(),
@@ -837,6 +844,16 @@ fn parse_battery_options(s: Option<&str>) -> argument::Result<BatteryType> {
 }
 
 #[cfg(feature = "direct")]
+fn parse_hex_or_decimal(maybe_hex_string: &str) -> Result<u64, std::num::ParseIntError> {
+    // Parse string starting with 0x as hex and others as numbers.
+    let without_prefix = maybe_hex_string.strip_prefix("0x");
+    match without_prefix {
+        Some(hex_string) => u64::from_str_radix(hex_string, 16),
+        None => u64::from_str(maybe_hex_string),
+    }
+}
+
+#[cfg(feature = "direct")]
 fn parse_direct_io_options(s: Option<&str>) -> argument::Result<DirectIoOption> {
     let s = s.ok_or(argument::Error::ExpectedValue(String::from(
         "expected path@range[,range] value",
@@ -855,25 +872,26 @@ fn parse_direct_io_options(s: Option<&str>) -> argument::Result<DirectIoOption> 
             expected: String::from("the path does not exist"),
         });
     };
-    let ranges: argument::Result<Vec<(u64, u64)>> = parts[1]
+    let ranges: argument::Result<Vec<BusRange>> = parts[1]
         .split(',')
         .map(|frag| frag.split('-'))
         .map(|mut range| {
             let base = range
                 .next()
-                .map(|v| v.parse::<u64>())
+                .map(|v| parse_hex_or_decimal(v))
                 .map_or(Ok(None), |r| r.map(Some));
             let last = range
                 .next()
-                .map(|v| v.parse::<u64>())
+                .map(|v| parse_hex_or_decimal(v))
                 .map_or(Ok(None), |r| r.map(Some));
             (base, last)
         })
         .map(|range| match range {
-            (Ok(Some(base)), Ok(None)) => Ok((base, 1)),
-            (Ok(Some(base)), Ok(Some(last))) => {
-                Ok((base, last.saturating_sub(base).saturating_add(1)))
-            }
+            (Ok(Some(base)), Ok(None)) => Ok(BusRange { base, len: 1 }),
+            (Ok(Some(base)), Ok(Some(last))) => Ok(BusRange {
+                base,
+                len: last.saturating_sub(base).saturating_add(1),
+            }),
             (Err(e), _) => Err(argument::Error::InvalidValue {
                 value: e.to_string(),
                 expected: String::from("invalid base range value"),
@@ -1073,7 +1091,7 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         #[cfg(feature = "audio_cras")]
         "cras-snd" => {
-            cfg.cras_snd = Some(
+            cfg.cras_snds.push(
                 value
                     .unwrap()
                     .parse()
@@ -2172,7 +2190,13 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
     Ok(())
 }
 
-fn run_vm(args: std::env::Args) -> std::result::Result<(), ()> {
+enum CommandStatus {
+    Success,
+    VmReset,
+    VmStop,
+}
+
+fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
     let arguments =
         &[Argument::positional("KERNEL", "bzImage of kernel to run"),
           Argument::value("kvm-device", "PATH", "Path to the KVM device. (default /dev/kvm)"),
@@ -2370,9 +2394,9 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vhost-user-fs", "SOCKET_PATH:TAG",
                           "Path to a socket path for vhost-user fs, and tag for the shared dir"),
           #[cfg(feature = "direct")]
-          Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access"),
+          Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
           #[cfg(feature = "direct")]
-          Argument::value("direct-mmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct memory mapped I/O access"),
+          Argument::value("direct-mmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct memory mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
           #[cfg(feature = "direct")]
           Argument::value("direct-level-irq", "irq", "Enable interrupt passthrough"),
           #[cfg(feature = "direct")]
@@ -2404,7 +2428,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
             match crosvm::plugin::run_config(cfg) {
                 Ok(_) => {
                     info!("crosvm and plugin have exited normally");
-                    Ok(())
+                    Ok(CommandStatus::VmStop)
                 }
                 Err(e) => {
                     error!("{}", e);
@@ -2413,18 +2437,22 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
             }
         }
         Ok(()) => match platform::run_config(cfg) {
-            Ok(_) => {
+            Ok(platform::ExitState::Stop) => {
                 info!("crosvm has exited normally");
-                Ok(())
+                Ok(CommandStatus::VmStop)
+            }
+            Ok(platform::ExitState::Reset) => {
+                info!("crosvm has exited normally due to reset request");
+                Ok(CommandStatus::VmReset)
             }
             Err(e) => {
-                error!("crosvm has exited with error: {}", e);
+                error!("crosvm has exited with error: {:#}", e);
                 Err(())
             }
         },
         Err(argument::Error::PrintHelp) => {
             print_help("crosvm run", "KERNEL", &arguments[..]);
-            Ok(())
+            Ok(CommandStatus::Success)
         }
         Err(e) => {
             error!("{}", e);
@@ -2939,7 +2967,7 @@ fn print_usage() {
     println!("    version - Show package version.");
 }
 
-fn crosvm_main() -> std::result::Result<(), ()> {
+fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
     if let Err(e) = syslog::init() {
         println!("failed to initialize syslog: {}", e);
         return Err(());
@@ -2953,32 +2981,42 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         return Err(());
     }
 
-    // Past this point, usage of exit is in danger of leaking zombie processes.
-    let ret = match args.next().as_ref().map(|a| a.as_ref()) {
+    let command = match args.next() {
+        Some(c) => c,
         None => {
             print_usage();
-            Ok(())
+            return Ok(CommandStatus::Success);
         }
-        Some("balloon") => balloon_vms(args),
-        Some("balloon_stats") => balloon_stats(args),
-        Some("battery") => modify_battery(args),
-        #[cfg(feature = "composite-disk")]
-        Some("create_composite") => create_composite(args),
-        Some("create_qcow2") => create_qcow2(args),
-        Some("device") => start_device(args),
-        Some("disk") => disk_cmd(args),
-        Some("make_rt") => make_rt(args),
-        Some("resume") => resume_vms(args),
-        Some("run") => run_vm(args),
-        Some("stop") => stop_vms(args),
-        Some("suspend") => suspend_vms(args),
-        Some("usb") => modify_usb(args),
-        Some("version") => pkg_version(),
-        Some(c) => {
-            println!("invalid subcommand: {:?}", c);
-            print_usage();
-            Err(())
+    };
+
+    // Past this point, usage of exit is in danger of leaking zombie processes.
+    let ret = if command == "run" {
+        // We handle run_vm separately because it does not simply signal sucess/error
+        // but also indicates whether the guest requested reset or stop.
+        run_vm(args)
+    } else {
+        match &command[..] {
+            "balloon" => balloon_vms(args),
+            "balloon_stats" => balloon_stats(args),
+            "battery" => modify_battery(args),
+            #[cfg(feature = "composite-disk")]
+            "create_composite" => create_composite(args),
+            "create_qcow2" => create_qcow2(args),
+            "device" => start_device(args),
+            "disk" => disk_cmd(args),
+            "make_rt" => make_rt(args),
+            "resume" => resume_vms(args),
+            "stop" => stop_vms(args),
+            "suspend" => suspend_vms(args),
+            "usb" => modify_usb(args),
+            "version" => pkg_version(),
+            c => {
+                println!("invalid subcommand: {:?}", c);
+                print_usage();
+                Err(())
+            }
         }
+        .map(|_| CommandStatus::Success)
     };
 
     // Reap exit status from any child device processes. At this point, all devices should have been
@@ -2999,7 +3037,12 @@ fn crosvm_main() -> std::result::Result<(), ()> {
 }
 
 fn main() {
-    std::process::exit(if crosvm_main().is_ok() { 0 } else { 1 });
+    let exit_code = match crosvm_main() {
+        Ok(CommandStatus::Success | CommandStatus::VmStop) => 0,
+        Ok(CommandStatus::VmReset) => 32,
+        Err(_) => 1,
+    };
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
@@ -3660,5 +3703,38 @@ mod tests {
         assert_eq!(params.subsystem_vendor_id, 0xfffc);
         assert_eq!(params.subsystem_device_id, 0xfffb);
         assert_eq!(params.revision_id, 0xa);
+    }
+
+    #[cfg(feature = "direct")]
+    #[test]
+    fn parse_direct_io_options_valid() {
+        let params = parse_direct_io_options(Some("/dev/mem@1,100-110")).unwrap();
+        assert_eq!(params.path.to_str(), Some("/dev/mem"));
+        assert_eq!(params.ranges[0], BusRange { base: 1, len: 1 });
+        assert_eq!(params.ranges[1], BusRange { base: 100, len: 11 });
+    }
+
+    #[cfg(feature = "direct")]
+    #[test]
+    fn parse_direct_io_options_hex() {
+        let params = parse_direct_io_options(Some("/dev/mem@1,0x10,100-110,0x10-0x20")).unwrap();
+        assert_eq!(params.path.to_str(), Some("/dev/mem"));
+        assert_eq!(params.ranges[0], BusRange { base: 1, len: 1 });
+        assert_eq!(params.ranges[1], BusRange { base: 0x10, len: 1 });
+        assert_eq!(params.ranges[2], BusRange { base: 100, len: 11 });
+        assert_eq!(
+            params.ranges[3],
+            BusRange {
+                base: 0x10,
+                len: 0x11
+            }
+        );
+    }
+
+    #[cfg(feature = "direct")]
+    #[test]
+    fn parse_direct_io_options_invalid() {
+        let _ = parse_direct_io_options(Some("/dev/mem@0y10"))
+            .expect_err("invalid digit found in string");
     }
 }

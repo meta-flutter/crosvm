@@ -50,8 +50,6 @@ use devices::virtio::{
 };
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
-#[cfg(feature = "direct")]
-use devices::BusRange;
 use devices::ProtectionType;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqChip, IrqEventIndex, KvmKernelIrqChip,
@@ -607,7 +605,7 @@ fn create_tap_net_device(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
     }
     let features = virtio::base_features(cfg.protected_vm);
     let dev =
-        virtio::Net::from(features, tap, vq_pairs).context("failed to set up virtio networking")?;
+        virtio::Net::from(features, tap, vq_pairs).context("failed to create tap net device")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -641,7 +639,7 @@ fn create_net_device(
         Box::new(dev) as Box<dyn VirtioDevice>
     } else {
         let dev = virtio::Net::<Tap>::new(features, host_ip, netmask, mac_address, vq_pairs)
-            .context("failed to set up virtio networking")?;
+            .context("failed to create virtio network device")?;
         Box::new(dev) as Box<dyn VirtioDevice>
     };
 
@@ -954,10 +952,21 @@ fn create_video_device(
                 "size=67108864",
             )?;
 
+            #[cfg(feature = "libvda")]
             // Render node for libvda.
             if backend == VideoBackendType::Libvda {
-                let dev_dri_path = Path::new("/dev/dri/renderD128");
-                jail.mount_bind(dev_dri_path, dev_dri_path, false)?;
+                // follow the implementation at:
+                // https://source.corp.google.com/chromeos_public/src/platform/minigbm/cros_gralloc/cros_gralloc_driver.cc;l=90;bpv=0;cl=c06cc9cccb3cf3c7f9d2aec706c27c34cd6162a0
+                const DRM_NUM_NODES: u32 = 63;
+                const DRM_RENDER_NODE_START: u32 = 128;
+                for offset in 0..DRM_NUM_NODES {
+                    let path_str = format!("/dev/dri/renderD{}", DRM_RENDER_NODE_START + offset);
+                    let dev_dri_path = Path::new(&path_str);
+                    if !dev_dri_path.exists() {
+                        break;
+                    }
+                    jail.mount_bind(dev_dri_path, dev_dri_path, false)?;
+                }
             }
 
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1350,7 +1359,7 @@ fn create_virtio_devices(
 
     #[cfg(feature = "audio_cras")]
     {
-        if let Some(cras_snd) = &cfg.cras_snd {
+        for cras_snd in &cfg.cras_snds {
             devs.push(create_cras_snd_device(cfg, cras_snd.clone())?);
         }
     }
@@ -1645,8 +1654,9 @@ fn create_vfio_device(
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container.clone(), iommu_enabled)
-        .context("failed to create vfio device")?;
+    let vfio_device =
+        VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_enabled)
+            .context("failed to create vfio device")?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         bus_num,
@@ -1686,7 +1696,7 @@ fn create_vfio_platform_device(
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new(vfio_path, vm, vfio_container, iommu_enabled)
+    let vfio_device = VfioDevice::new_passthrough(&vfio_path, vm, vfio_container, iommu_enabled)
         .context("Failed to create vfio device")?;
     let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
 
@@ -2439,7 +2449,12 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     })
 }
 
-pub fn run_config(cfg: Config) -> Result<()> {
+pub enum ExitState {
+    Reset,
+    Stop,
+}
+
+pub fn run_config(cfg: Config) -> Result<ExitState> {
     let components = setup_vm_components(&cfg)?;
 
     let guest_mem_layout =
@@ -2449,12 +2464,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
     if components.hugepages {
         mem_policy |= MemoryPolicy::USE_HUGEPAGES;
     }
-    if components.protected_vm == ProtectionType::Protected {
-        mem_policy |= MemoryPolicy::MLOCK_ON_FAULT;
-    }
-    guest_mem
-        .set_memory_policy(mem_policy)
-        .context("failed to set guest memory policy")?;
+    guest_mem.set_memory_policy(mem_policy);
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
     let vm = KvmVm::new(&kvm, guest_mem).context("failed to create vm")?;
     let vm_clone = vm.try_clone().context("failed to clone vm")?;
@@ -2510,7 +2520,7 @@ fn run_vm<Vcpu, V>(
     mut vm: V,
     irq_chip: &mut dyn IrqChipArch,
     ioapic_host_tube: Option<Tube>,
-) -> Result<()>
+) -> Result<ExitState>
 where
     Vcpu: VcpuArch + 'static,
     V: VmArch + 'static,
@@ -2645,6 +2655,7 @@ where
     }
 
     let exit_evt = Event::new().context("failed to create event")?;
+    let reset_evt = Event::new().context("failed to create event")?;
     let mut sys_allocator = Arch::create_system_allocator(vm.get_memory());
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
@@ -2698,6 +2709,7 @@ where
     let mut linux = Arch::build_vm::<V, Vcpu>(
         components,
         &exit_evt,
+        &reset_evt,
         &mut sys_allocator,
         &cfg.serial_parameters,
         simple_jail(&cfg, "serial")?,
@@ -2738,30 +2750,22 @@ where
         for range in pmio.ranges.iter() {
             linux
                 .io_bus
-                .insert_sync(direct_io.clone(), range.0, range.1)
+                .insert_sync(direct_io.clone(), range.base, range.len)
                 .unwrap();
         }
     };
 
     #[cfg(feature = "direct")]
     if let Some(mmio) = &cfg.direct_mmio {
-        let mut ranges = Vec::new();
-        for range in mmio.ranges.iter() {
-            ranges.push(BusRange {
-                base: range.0,
-                len: range.1,
-            });
-        }
-
         let direct_mmio = Arc::new(
-            devices::DirectMmio::new(&mmio.path, false, ranges)
+            devices::DirectMmio::new(&mmio.path, false, &mmio.ranges)
                 .context("failed to open direct mmio device")?,
         );
 
         for range in mmio.ranges.iter() {
             linux
                 .mmio_bus
-                .insert_sync(direct_mmio.clone(), range.0, range.1)
+                .insert_sync(direct_mmio.clone(), range.base, range.len)
                 .unwrap();
         }
     };
@@ -2817,6 +2821,7 @@ where
         #[cfg(feature = "usb")]
         usb_control_tube,
         exit_evt,
+        reset_evt,
         sigchld_fd,
         cfg.sandbox,
         Arc::clone(&map_request),
@@ -2939,6 +2944,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     disk_host_tubes: &[Tube],
     #[cfg(feature = "usb")] usb_control_tube: Tube,
     exit_evt: Event,
+    reset_evt: Event,
     sigchld_fd: SignalFd,
     sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
@@ -2946,10 +2952,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
     kvm_vcpu_ids: Vec<usize>,
-) -> Result<()> {
+) -> Result<ExitState> {
     #[derive(PollToken)]
     enum Token {
         Exit,
+        Reset,
         Suspend,
         ChildSignal,
         IrqFd { index: IrqEventIndex },
@@ -2963,6 +2970,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     let wait_ctx = WaitContext::build_with(&[
         (&exit_evt, Token::Exit),
+        (&reset_evt, Token::Reset),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
@@ -3082,6 +3090,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 
     vcpu_thread_barrier.wait();
 
+    let mut exit_state = ExitState::Stop;
     let mut balloon_stats_id: u64 = 0;
 
     'wait: loop {
@@ -3104,6 +3113,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             match event.token {
                 Token::Exit => {
                     info!("vcpu requested shutdown");
+                    break 'wait;
+                }
+                Token::Reset => {
+                    info!("vcpu requested reset");
+                    exit_state = ExitState::Reset;
                     break 'wait;
                 }
                 Token::Suspend => {
@@ -3376,5 +3390,5 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .set_canon_mode()
         .expect("failed to restore canonical mode for terminal");
 
-    Ok(())
+    Ok(exit_state)
 }

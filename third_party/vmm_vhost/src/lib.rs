@@ -32,6 +32,7 @@
 
 #![deny(missing_docs)]
 
+#[cfg(any(feature = "vmm", feature = "device"))]
 use std::fs::File;
 use std::io::Error as IOError;
 
@@ -43,8 +44,7 @@ pub use backend::*;
 
 pub mod message;
 
-mod connection;
-pub use self::connection::{SocketEndpoint, SocketListener};
+pub mod connection;
 
 #[cfg(feature = "vmm")]
 mod master;
@@ -65,7 +65,7 @@ pub use self::slave::SlaveListener;
 mod slave_req_handler;
 #[cfg(feature = "device")]
 pub use self::slave_req_handler::{
-    SlaveReqHandler, VhostUserSlaveReqHandler, VhostUserSlaveReqHandlerMut,
+    SlaveReqHandler, SlaveReqHelper, VhostUserSlaveReqHandler, VhostUserSlaveReqHandlerMut,
 };
 #[cfg(feature = "device")]
 mod slave_fs_cache;
@@ -118,6 +118,9 @@ pub enum Error {
     /// Should retry the socket operation again.
     #[error("temporary socket error: {0}")]
     SocketRetry(std::io::Error),
+    /// Error from VFIO device.
+    #[error("error occurred in VFIO device: {0}")]
+    VfioDeviceError(anyhow::Error),
 }
 
 impl Error {
@@ -139,6 +142,7 @@ impl Error {
             Error::SocketError(_) | Error::SocketConnect(_) => false,
             Error::FeatureMismatch => false,
             Error::ReqHandlerError(_) => false,
+            Error::VfioDeviceError(_) => false,
         }
     }
 }
@@ -209,7 +213,7 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
-    use super::connection::SocketEndpoint;
+    use super::connection::socket::{Endpoint, Listener};
     use super::dummy_slave::{DummySlaveReqHandler, VIRTIO_FEATURES};
     use super::message::*;
     use super::*;
@@ -224,12 +228,15 @@ mod tests {
     fn create_slave<P, S>(
         path: P,
         backend: Arc<S>,
-    ) -> (Master, SlaveReqHandler<S, SocketEndpoint<MasterReq>>)
+    ) -> (
+        Master<Endpoint<MasterReq>>,
+        SlaveReqHandler<S, Endpoint<MasterReq>>,
+    )
     where
         P: AsRef<Path>,
         S: VhostUserSlaveReqHandler,
     {
-        let listener = SocketListener::new(&path, true).unwrap();
+        let listener = Listener::new(&path, true).unwrap();
         let mut slave_listener = SlaveListener::new(listener, backend).unwrap();
         let master = Master::connect(&path, 1).unwrap();
         (master, slave_listener.accept().unwrap().unwrap())

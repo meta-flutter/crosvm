@@ -4,9 +4,6 @@
 
 mod fdt;
 
-const E820_RAM: u32 = 1;
-const E820_RESERVED: u32 = 2;
-
 const SETUP_DTB: u32 = 2;
 const X86_64_FDT_MAX_SIZE: u64 = 0x200000;
 
@@ -190,6 +187,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct X8664arch;
 
+enum E820Type {
+    Ram = 0x01,
+    Reserved = 0x2,
+}
+
 const BOOT_STACK_POINTER: u64 = 0x8000;
 // Make sure it align to 256MB for MTRR convenient
 const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
@@ -262,7 +264,7 @@ fn configure_system(
         params.hdr.ramdisk_size = initrd_size as u32;
     }
 
-    add_e820_entry(&mut params, 0, EBDA_START, E820_RAM)?;
+    add_e820_entry(&mut params, 0, EBDA_START, E820Type::Ram)?;
 
     let mem_end = guest_mem.end_addr();
     if mem_end < end_32bit_gap_start {
@@ -270,21 +272,21 @@ fn configure_system(
             &mut params,
             kernel_addr.offset() as u64,
             mem_end.offset_from(kernel_addr) as u64,
-            E820_RAM,
+            E820Type::Ram,
         )?;
     } else {
         add_e820_entry(
             &mut params,
             kernel_addr.offset() as u64,
             end_32bit_gap_start.offset_from(kernel_addr) as u64,
-            E820_RAM,
+            E820Type::Ram,
         )?;
         if mem_end > first_addr_past_32bits {
             add_e820_entry(
                 &mut params,
                 first_addr_past_32bits.offset() as u64,
                 mem_end.offset_from(first_addr_past_32bits) as u64,
-                E820_RAM,
+                E820Type::Ram,
             )?;
         }
     }
@@ -293,7 +295,7 @@ fn configure_system(
         &mut params,
         PCIE_CFG_MMIO_START,
         PCIE_CFG_MMIO_SIZE,
-        E820_RESERVED,
+        E820Type::Reserved,
     )?;
 
     let zero_page_addr = GuestAddress(ZERO_PAGE_OFFSET);
@@ -309,14 +311,19 @@ fn configure_system(
 
 /// Add an e820 region to the e820 map.
 /// Returns Ok(()) if successful, or an error if there is no space left in the map.
-fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32) -> Result<()> {
+fn add_e820_entry(
+    params: &mut boot_params,
+    addr: u64,
+    size: u64,
+    mem_type: E820Type,
+) -> Result<()> {
     if params.e820_entries >= params.e820_table.len() as u8 {
         return Err(Error::E820Configuration);
     }
 
     params.e820_table[params.e820_entries as usize].addr = addr;
     params.e820_table[params.e820_entries as usize].size = size;
-    params.e820_table[params.e820_entries as usize].type_ = mem_type;
+    params.e820_table[params.e820_entries as usize].type_ = mem_type as u32;
     params.e820_entries += 1;
 
     Ok(())
@@ -884,6 +891,89 @@ fn phys_addr(mem: &GuestMemory, vaddr: u64, sregs: &Sregs) -> Result<(u64, u64)>
     Err(Error::TranslatingVirtAddr)
 }
 
+// OSC returned status register in CDW1
+const OSC_STATUS_UNSUPPORT_UUID: u32 = 0x4;
+// pci host bridge OSC returned control register in CDW3
+#[allow(dead_code)]
+const PCI_HB_OSC_CONTROL_PCIE_HP: u32 = 0x1;
+const PCI_HB_OSC_CONTROL_SHPC_HP: u32 = 0x2;
+const PCI_HB_OSC_CONTROL_PCIE_PME: u32 = 0x4;
+const PCI_HB_OSC_CONTROL_PCIE_AER: u32 = 0x8;
+#[allow(dead_code)]
+const PCI_HB_OSC_CONTROL_PCIE_CAP: u32 = 0x10;
+
+struct PciRootOSC {}
+
+// Method (_OSC, 4, NotSerialized)  // _OSC: Operating System Capabilities
+// {
+//     CreateDWordField (Arg3, Zero, CDW1)  // flag and return value
+//     If (Arg0 == ToUUID ("33db4d5b-1ff7-401c-9657-7441c03dd766"))
+//     {
+//         CreateDWordField (Arg3, 8, CDW3) // control field
+//         if ( 0 == (CDW1 & 0x01))  // Query flag ?
+//         {
+//              CDW3 &= !(SHPC_HP | PME | AER)
+//         }
+//     } Else {
+//         CDW1 |= UNSUPPORT_UUID
+//     }
+//     Return (Arg3)
+// }
+impl Aml for PciRootOSC {
+    fn to_aml_bytes(&self, aml: &mut Vec<u8>) {
+        let osc_uuid = "33DB4D5B-1FF7-401C-9657-7441C03DD766";
+        // virtual pcie root port supports hotplug and pcie cap register only, clear all
+        // the other bits.
+        let mask = !(PCI_HB_OSC_CONTROL_SHPC_HP
+            | PCI_HB_OSC_CONTROL_PCIE_PME
+            | PCI_HB_OSC_CONTROL_PCIE_AER);
+        aml::Method::new(
+            "_OSC".into(),
+            4,
+            false,
+            vec![
+                &aml::CreateDWordField::new(
+                    &aml::Name::new_field_name("CDW1"),
+                    &aml::Arg(3),
+                    &aml::ZERO,
+                ),
+                &aml::If::new(
+                    &aml::Equal::new(&aml::Arg(0), &aml::Uuid::new(osc_uuid)),
+                    vec![
+                        &aml::CreateDWordField::new(
+                            &aml::Name::new_field_name("CDW3"),
+                            &aml::Arg(3),
+                            &(8_u8),
+                        ),
+                        &aml::If::new(
+                            &aml::Equal::new(
+                                &aml::ZERO,
+                                &aml::And::new(
+                                    &aml::Local(0),
+                                    &aml::Name::new_field_name("CDW1"),
+                                    &aml::ONE,
+                                ),
+                            ),
+                            vec![&aml::And::new(
+                                &aml::Name::new_field_name("CDW3"),
+                                &mask,
+                                &aml::Name::new_field_name("CDW3"),
+                            )],
+                        ),
+                    ],
+                ),
+                &aml::Else::new(vec![&aml::Or::new(
+                    &aml::Name::new_field_name("CDW1"),
+                    &OSC_STATUS_UNSUPPORT_UUID,
+                    &aml::Name::new_field_name("CDW1"),
+                )]),
+                &aml::Return::new(&aml::Arg(3)),
+            ],
+        )
+        .to_aml_bytes(aml)
+    }
+}
+
 impl X8664arch {
     /// Loads the bios from an open file.
     ///
@@ -1040,11 +1130,7 @@ impl X8664arch {
     /// This returns a minimal kernel command for this architecture
     fn get_base_linux_cmdline() -> kernel_cmdline::Cmdline {
         let mut cmdline = kernel_cmdline::Cmdline::new(CMDLINE_MAX_SIZE as usize);
-        // _OSC give OS the pcie hotplug capability, but _OSC is missed in dsdt, so
-        // pcie_ports=native is used to force enable pcie hotplug temporary.
-        // Once pcie enhanced configuration access feature is enabled, _OSC
-        // will be added, then this parameter will be removed.
-        cmdline.insert_str("panic=-1 pcie_ports=native").unwrap();
+        cmdline.insert_str("panic=-1").unwrap();
 
         cmdline
     }
@@ -1187,6 +1273,9 @@ impl X8664arch {
             ]),
         );
         pci_dsdt_inner_data.push(&crs);
+
+        let pci_root_osc = PciRootOSC {};
+        pci_dsdt_inner_data.push(&pci_root_osc);
 
         aml::Device::new("_SB_.PCI0".into(), pci_dsdt_inner_data).to_aml_bytes(&mut amls);
 

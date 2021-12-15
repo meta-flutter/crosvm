@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 //! virgl_renderer: Handles 3D virtio-gpu hypercalls using virglrenderer.
-//! External code found at https://gitlab.freedesktop.org/virgl/virglrenderer/.
+//! External code found at <https://gitlab.freedesktop.org/virgl/virglrenderer/>.
 
 #![cfg(feature = "virgl_renderer")]
 
@@ -28,12 +28,12 @@ use crate::rutabaga_utils::*;
 
 use data_model::VolatileSlice;
 
-use libc::close;
-
 type Query = virgl_renderer_export_query;
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct VirglRenderer {
+    // Cookie must be kept alive until VirglRenderer is dropped.
+    _cookie: Box<VirglCookie>,
     fence_state: Rc<RefCell<FenceState>>,
 }
 
@@ -105,12 +105,20 @@ extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: *mut __va_l
 }
 
 const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_callbacks {
+    #[cfg(not(feature = "virgl_renderer_next"))]
     version: 1,
+    #[cfg(feature = "virgl_renderer_next")]
+    version: 3,
     write_fence: Some(write_fence),
     create_gl_context: None,
     destroy_gl_context: None,
     make_current: None,
     get_drm_fd: None,
+    write_context_fence: None,
+    #[cfg(not(feature = "virgl_renderer_next"))]
+    get_server_fd: None,
+    #[cfg(feature = "virgl_renderer_next")]
+    get_server_fd: Some(get_server_fd),
 };
 
 /// Retrieves metadata suitable for export about this resource. If "export_fd" is true,
@@ -169,6 +177,7 @@ impl VirglRenderer {
     pub fn init(
         virglrenderer_flags: VirglRendererFlags,
         fence_handler: RutabagaFenceHandler,
+        render_server_fd: Option<SafeDescriptor>,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
         if cfg!(debug_assertions) {
             let ret = unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) };
@@ -188,19 +197,15 @@ impl VirglRenderer {
             return Err(RutabagaError::AlreadyInUse);
         }
 
-        // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
-        // Otherwise, Resource and Context would become invalid because their lifetime is not tied
-        // to the Renderer instance. Doing so greatly simplifies the ownership for users of this
-        // library.
-
         let fence_state = Rc::new(RefCell::new(FenceState {
             latest_fence: 0,
             handler: Some(fence_handler),
         }));
 
-        let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
+        let mut cookie = Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
-        }));
+            render_server_fd,
+        });
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
@@ -211,14 +216,17 @@ impl VirglRenderer {
         // error.
         let ret = unsafe {
             virgl_renderer_init(
-                cookie as *mut c_void,
+                &mut *cookie as *mut _ as *mut c_void,
                 virglrenderer_flags.into(),
                 transmute(VIRGL_RENDERER_CALLBACKS),
             )
         };
 
         ret_to_res(ret)?;
-        Ok(Box::new(VirglRenderer { fence_state }))
+        Ok(Box::new(VirglRenderer {
+            _cookie: cookie,
+            fence_state,
+        }))
     }
 
     #[allow(unused_variables)]
@@ -264,22 +272,38 @@ impl VirglRenderer {
             };
             ret_to_res(ret)?;
 
-            /* Only support dma-bufs until someone wants opaque fds too. */
-            if fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF {
-                // Safe because the FD was just returned by a successful virglrenderer
-                // call so it must be valid and owned by us.
-                unsafe { close(fd) };
-                return Err(RutabagaError::Unsupported);
-            }
+            // Safe because the FD was just returned by a successful virglrenderer
+            // call so it must be valid and owned by us.
+            let handle = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
 
-            let dmabuf = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
+            let handle_type = match fd_type {
+                VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF => RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
+                VIRGL_RENDERER_BLOB_FD_TYPE_SHM => RUTABAGA_MEM_HANDLE_TYPE_SHM,
+                _ => {
+                    return Err(RutabagaError::Unsupported);
+                }
+            };
+
             Ok(Arc::new(RutabagaHandle {
-                os_handle: dmabuf,
-                handle_type: RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
+                os_handle: handle,
+                handle_type,
             }))
         }
         #[cfg(not(feature = "virgl_renderer_next"))]
         Err(RutabagaError::Unsupported)
+    }
+}
+
+impl Drop for VirglRenderer {
+    fn drop(&mut self) {
+        // Safe because virglrenderer is initialized.
+        //
+        // This invalidates all context ids and resource ids.  It is fine because struct Rutabaga
+        // makes sure contexts and resources are dropped before this is reached.  Even if it did
+        // not, virglrenderer is designed to deal with invalid ids safely.
+        unsafe {
+            virgl_renderer_cleanup(null_mut());
+        }
     }
 }
 

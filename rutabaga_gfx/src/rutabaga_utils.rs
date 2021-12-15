@@ -286,6 +286,7 @@ const VIRGLRENDERER_USE_EXTERNAL_BLOB: u32 = 1 << 5;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
+const VIRGLRENDERER_MULTI_PROCESS: u32 = 1 << 9;
 
 /// virglrenderer flag struct.
 #[derive(Copy, Clone)]
@@ -299,6 +300,7 @@ impl Default for VirglRendererFlags {
             .use_egl(true)
             .use_surfaceless(true)
             .use_gles(true)
+            .use_multi_process(false)
     }
 }
 
@@ -365,6 +367,10 @@ impl VirglRendererFlags {
     /// Retire fence directly from sync thread.
     pub fn use_async_fence_cb(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_ASYNC_FENCE_CB, v)
+    }
+
+    pub fn use_multi_process(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_MULTI_PROCESS, v)
     }
 }
 
@@ -504,9 +510,10 @@ pub enum RutabagaComponentType {
 pub const RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0001;
 pub const RUTABAGA_MEM_HANDLE_TYPE_DMABUF: u32 = 0x0002;
 pub const RUTABAGE_MEM_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0003;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0004;
-pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0005;
-pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0006;
+pub const RUTABAGA_MEM_HANDLE_TYPE_SHM: u32 = 0x0004;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0010;
+pub const RUTABAGA_FENCE_HANDLE_TYPE_SYNC_FD: u32 = 0x0011;
+pub const RUTABAGE_FENCE_HANDLE_TYPE_OPAQUE_WIN32: u32 = 0x0012;
 
 /// Handle to OS-specific memory or synchronization objects.
 pub struct RutabagaHandle {

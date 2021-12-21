@@ -28,6 +28,8 @@ use crosvm::{
     DISK_ID_LEN,
 };
 use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
+#[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+use devices::virtio::gpu::GpuRenderServerParameters;
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Error as CrasSndError;
 use devices::virtio::vhost::user::device::{
@@ -543,6 +545,52 @@ fn parse_gpu_display_options(
     });
 
     Ok(())
+}
+
+#[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+fn parse_gpu_render_server_options(
+    s: Option<&str>,
+    gpu_params: &mut GpuParameters,
+) -> argument::Result<()> {
+    let mut path: Option<PathBuf> = None;
+
+    if let Some(s) = s {
+        let opts = s
+            .split(',')
+            .map(|frag| frag.split('='))
+            .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
+
+        for (k, v) in opts {
+            match k {
+                "path" => {
+                    path =
+                        Some(
+                            PathBuf::from_str(v).map_err(|e| argument::Error::InvalidValue {
+                                value: v.to_string(),
+                                expected: e.to_string(),
+                            })?,
+                        )
+                }
+                "" => {}
+                _ => {
+                    return Err(argument::Error::UnknownArgument(format!(
+                        "gpu-render-server parameter {}",
+                        k
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(p) = path {
+        gpu_params.render_server = Some(GpuRenderServerParameters { path: p });
+        Ok(())
+    } else {
+        Err(argument::Error::InvalidValue {
+            value: s.unwrap_or("").to_string(),
+            expected: String::from("gpu-render-server must include 'path'"),
+        })
+    }
 }
 
 #[cfg(feature = "audio")]
@@ -1804,19 +1852,23 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     })?,
             );
         }
+        "tap-name" => {
+            cfg.tap_name.push(value.unwrap().to_owned());
+        }
         #[cfg(feature = "gpu")]
         "gpu" => {
-            if cfg.gpu_parameters.is_none() {
-                cfg.gpu_parameters = Some(Default::default());
-            }
-            parse_gpu_options(value, cfg.gpu_parameters.as_mut().unwrap())?;
+            let gpu_parameters = cfg.gpu_parameters.get_or_insert_with(Default::default);
+            parse_gpu_options(value, gpu_parameters)?;
         }
         #[cfg(feature = "gpu")]
         "gpu-display" => {
-            if cfg.gpu_parameters.is_none() {
-                cfg.gpu_parameters = Some(Default::default());
-            }
-            parse_gpu_display_options(value, cfg.gpu_parameters.as_mut().unwrap())?;
+            let gpu_parameters = cfg.gpu_parameters.get_or_insert_with(Default::default);
+            parse_gpu_display_options(value, gpu_parameters)?;
+        }
+        #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+        "gpu-render-server" => {
+            let gpu_parameters = cfg.gpu_parameters.get_or_insert_with(Default::default);
+            parse_gpu_render_server_options(value, gpu_parameters)?;
         }
         "software-tpm" => {
             cfg.software_tpm = true;
@@ -2331,6 +2383,9 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
           #[cfg(feature = "plugin")]
           Argument::value("plugin-gid-map-file", "PATH", "Path to the file listing supplemental GIDs that should be mapped in plugin jail.  Can be given more than once."),
           Argument::flag("vhost-net", "Use vhost for networking."),
+          Argument::value("tap-name",
+                          "NAME",
+                          "Name of a configured persistent TAP interface to use for networking. A different virtual network card will be added each time this argument is given."),
           Argument::value("tap-fd",
                           "fd",
                           "File descriptor for configured tap device. A different virtual network card will be added each time this argument is given."),
@@ -2355,6 +2410,12 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                               Possible key values:
                               width=INT - The width of the virtual display connected to the virtio-gpu.
                               height=INT - The height of the virtual display connected to the virtio-gpu."),
+          #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
+          Argument::flag_or_value("gpu-render-server",
+                                  "[path=PATH]",
+                                  "(EXPERIMENTAL) Comma separated key=value pairs for setting up a render server for the virtio-gpu device
+                              Possible key values:
+                              path=PATH - The path to the render server executable."),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
@@ -2950,7 +3011,7 @@ fn pkg_version() -> std::result::Result<(), ()> {
 }
 
 fn print_usage() {
-    print_help("crosvm", "[command]", &[]);
+    print_help("crosvm", "[--extended-status] [command]", &[]);
     println!("Commands:");
     println!("    balloon - Set balloon size of the crosvm instance.");
     println!("    balloon_stats - Prints virtio balloon statistics.");
@@ -2986,7 +3047,16 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
         return Err(());
     }
 
-    let command = match args.next() {
+    let mut cmd_arg = args.next();
+    let extended_status = match cmd_arg.as_ref().map(|s| s.as_ref()) {
+        Some("--extended-status") => {
+            cmd_arg = args.next();
+            true
+        }
+        _ => false,
+    } || cfg!(feature = "direct"); // TODO(dtor): remove default for crosvm-direct after transition
+
+    let command = match cmd_arg {
         Some(c) => c,
         None => {
             print_usage();
@@ -2996,7 +3066,7 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
 
     // Past this point, usage of exit is in danger of leaking zombie processes.
     let ret = if command == "run" {
-        // We handle run_vm separately because it does not simply signal sucess/error
+        // We handle run_vm separately because it does not simply signal success/error
         // but also indicates whether the guest requested reset or stop.
         run_vm(args)
     } else {
@@ -3038,7 +3108,13 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
 
     // WARNING: Any code added after this point is not guaranteed to run
     // since we may forcibly kill this process (and its children) above.
-    ret
+    ret.map(|s| {
+        if extended_status {
+            s
+        } else {
+            CommandStatus::Success
+        }
+    })
 }
 
 fn main() {

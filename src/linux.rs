@@ -44,7 +44,7 @@ use devices::virtio::VideoBackendType;
 use devices::virtio::{self, Console, VirtioDevice};
 #[cfg(feature = "gpu")]
 use devices::virtio::{
-    gpu::{DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH},
+    gpu::{GpuRenderServerParameters, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH},
     vhost::user::vmm::Gpu as VhostUserGpu,
     EventDevice,
 };
@@ -588,70 +588,83 @@ fn create_balloon_device(cfg: &Config, tube: Tube) -> DeviceResult {
     })
 }
 
-fn create_tap_net_device(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
-    // Safe because we ensure that we get a unique handle to the fd.
-    let tap = unsafe {
-        Tap::from_raw_descriptor(
-            validate_raw_descriptor(tap_fd).context("failed to validate tap descriptor")?,
-        )
-        .context("failed to create tap device")?
-    };
-
+/// Generic method for creating a network device. `create_device` is a closure that takes the virtio
+/// features and number of queue pairs as parameters, and is responsible for creating the device
+/// itself.
+fn create_net_device<F, T>(cfg: &Config, policy: &str, create_device: F) -> DeviceResult
+where
+    F: Fn(u64, u16) -> Result<T>,
+    T: VirtioDevice + 'static,
+{
     let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
     let vcpu_count = cfg.vcpu_count.unwrap_or(1);
     if vcpu_count < vq_pairs as usize {
-        error!("net vq pairs must be smaller than vcpu count, fall back to single queue mode");
+        warn!("the number of net vq pairs must not exceed the vcpu count, falling back to single queue mode");
         vq_pairs = 1;
     }
     let features = virtio::base_features(cfg.protected_vm);
-    let dev =
-        virtio::Net::from(features, tap, vq_pairs).context("failed to create tap net device")?;
+
+    let dev = create_device(features, vq_pairs)?;
 
     Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: simple_jail(cfg, "net_device")?,
+        dev: Box::new(dev) as Box<dyn VirtioDevice>,
+        jail: simple_jail(cfg, policy)?,
     })
 }
 
-fn create_net_device(
+/// Returns a network device created from a new TAP interface configured with `host_ip`, `netmask`,
+/// and `mac_address`.
+fn create_net_device_from_config(
     cfg: &Config,
     host_ip: Ipv4Addr,
     netmask: Ipv4Addr,
     mac_address: MacAddress,
 ) -> DeviceResult {
-    let mut vq_pairs = cfg.net_vq_pairs.unwrap_or(1);
-    let vcpu_count = cfg.vcpu_count.unwrap_or(1);
-    if vcpu_count < vq_pairs as usize {
-        error!("net vq pairs must be smaller than vcpu count, fall back to single queue mode");
-        vq_pairs = 1;
-    }
-
-    let features = virtio::base_features(cfg.protected_vm);
-    let dev = if cfg.vhost_net {
-        let dev = virtio::vhost::Net::<Tap, vhost::Net<Tap>>::new(
-            &cfg.vhost_net_device_path,
-            features,
-            host_ip,
-            netmask,
-            mac_address,
-        )
-        .context("failed to set up vhost networking")?;
-        Box::new(dev) as Box<dyn VirtioDevice>
-    } else {
-        let dev = virtio::Net::<Tap>::new(features, host_ip, netmask, mac_address, vq_pairs)
-            .context("failed to create virtio network device")?;
-        Box::new(dev) as Box<dyn VirtioDevice>
-    };
-
     let policy = if cfg.vhost_net {
         "vhost_net_device"
     } else {
         "net_device"
     };
 
-    Ok(VirtioDeviceStub {
-        dev,
-        jail: simple_jail(cfg, policy)?,
+    if cfg.vhost_net {
+        create_net_device(cfg, policy, |features, _vq_pairs| {
+            virtio::vhost::Net::<Tap, vhost::Net<Tap>>::new(
+                &cfg.vhost_net_device_path,
+                features,
+                host_ip,
+                netmask,
+                mac_address,
+            )
+            .context("failed to set up vhost networking")
+        })
+    } else {
+        create_net_device(cfg, policy, |features, vq_pairs| {
+            virtio::Net::<Tap>::new(features, host_ip, netmask, mac_address, vq_pairs)
+                .context("failed to create virtio network device")
+        })
+    }
+}
+
+/// Returns a network device from a file descriptor to a configured TAP interface.
+fn create_tap_net_device_from_fd(cfg: &Config, tap_fd: RawDescriptor) -> DeviceResult {
+    create_net_device(cfg, "net_device", |features, vq_pairs| {
+        // Safe because we ensure that we get a unique handle to the fd.
+        let tap = unsafe {
+            Tap::from_raw_descriptor(
+                validate_raw_descriptor(tap_fd).context("failed to validate tap descriptor")?,
+            )
+            .context("failed to create tap device")?
+        };
+
+        virtio::Net::from(features, tap, vq_pairs).context("failed to create tap net device")
+    })
+}
+
+/// Returns a network device created by opening the persistent, configured TAP interface `tap_name`.
+fn create_tap_net_device_from_name(cfg: &Config, tap_name: &[u8]) -> DeviceResult {
+    create_net_device(cfg, "net_device", |features, vq_pairs| {
+        virtio::Net::<Tap>::new_from_name(features, tap_name, vq_pairs)
+            .context("failed to create configured virtio network device")
     })
 }
 
@@ -715,49 +728,8 @@ fn create_vhost_user_gpu_device(
 }
 
 #[cfg(feature = "gpu")]
-fn create_gpu_device(
-    cfg: &Config,
-    exit_evt: &Event,
-    gpu_device_tube: Tube,
-    resource_bridges: Vec<Tube>,
-    wayland_socket_path: Option<&PathBuf>,
-    x_display: Option<String>,
-    event_devices: Vec<EventDevice>,
-    map_request: Arc<Mutex<Option<ExternalMapping>>>,
-) -> DeviceResult {
-    let mut display_backends = vec![
-        virtio::DisplayBackend::X(x_display),
-        virtio::DisplayBackend::Stub,
-    ];
-
-    let wayland_socket_dirs = cfg
-        .wayland_socket_paths
-        .iter()
-        .map(|(_name, path)| path.parent())
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| anyhow!("wayland socket path has no parent or file name"))?;
-
-    if let Some(socket_path) = wayland_socket_path {
-        display_backends.insert(
-            0,
-            virtio::DisplayBackend::Wayland(Some(socket_path.to_owned())),
-        );
-    }
-
-    let dev = virtio::Gpu::new(
-        exit_evt.try_clone().context("failed to clone event")?,
-        Some(gpu_device_tube),
-        resource_bridges,
-        display_backends,
-        cfg.gpu_parameters.as_ref().unwrap(),
-        event_devices,
-        map_request,
-        cfg.sandbox,
-        virtio::base_features(cfg.protected_vm),
-        cfg.wayland_socket_paths.clone(),
-    );
-
-    let jail = match simple_jail(cfg, "gpu_device")? {
+fn gpu_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
+    match simple_jail(cfg, policy)? {
         Some(mut jail) => {
             // Create a tmpfs in the device's root directory so that we can bind mount the
             // dri directory into it.  The size=67108864 is size=64*1024*1024 or size=64MB.
@@ -778,30 +750,6 @@ fn create_gpu_device(
             let drm_dri_path = Path::new("/dev/dri");
             if drm_dri_path.exists() {
                 jail.mount_bind(drm_dri_path, drm_dri_path, false)?;
-            }
-
-            // Prepare GPU shader disk cache directory.
-            if let Some(cache_dir) = cfg
-                .gpu_parameters
-                .as_ref()
-                .and_then(|params| params.cache_path.as_ref())
-            {
-                if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && cfg.sandbox {
-                    warn!("shader caching not yet supported on ARM with sandbox enabled");
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "true");
-                } else {
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "false");
-                    env::set_var("MESA_GLSL_CACHE_DIR", cache_dir);
-                    if let Some(cache_size) = cfg
-                        .gpu_parameters
-                        .as_ref()
-                        .and_then(|params| params.cache_size.as_ref())
-                    {
-                        env::set_var("MESA_GLSL_CACHE_MAX_SIZE", cache_size);
-                    }
-                    let shadercache_path = Path::new(cache_dir);
-                    jail.mount_bind(shadercache_path, shadercache_path, true)?;
-                }
             }
 
             // If the ARM specific devices exist on the host, bind mount them in.
@@ -837,16 +785,6 @@ fn create_gpu_device(
                 }
             }
 
-            // Bind mount the wayland socket's directory into jail's root. This is necessary since
-            // each new wayland context must open() the socket. If the wayland socket is ever
-            // destroyed and remade in the same host directory, new connections will be possible
-            // without restarting the wayland device.
-            for dir in &wayland_socket_dirs {
-                jail.mount_bind(dir, dir, true)?;
-            }
-
-            add_current_user_to_jail(&mut jail)?;
-
             // pvr driver requires read access to /proc/self/task/*/comm.
             let proc_path = Path::new("/proc");
             jail.mount(
@@ -863,6 +801,93 @@ fn create_gpu_device(
                 jail.mount_bind(perfetto_path, perfetto_path, true)?;
             }
 
+            Ok(Some(jail))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn create_gpu_device(
+    cfg: &Config,
+    exit_evt: &Event,
+    gpu_device_tube: Tube,
+    resource_bridges: Vec<Tube>,
+    wayland_socket_path: Option<&PathBuf>,
+    x_display: Option<String>,
+    render_server_fd: Option<SafeDescriptor>,
+    event_devices: Vec<EventDevice>,
+    map_request: Arc<Mutex<Option<ExternalMapping>>>,
+) -> DeviceResult {
+    let mut display_backends = vec![
+        virtio::DisplayBackend::X(x_display),
+        virtio::DisplayBackend::Stub,
+    ];
+
+    let wayland_socket_dirs = cfg
+        .wayland_socket_paths
+        .iter()
+        .map(|(_name, path)| path.parent())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow!("wayland socket path has no parent or file name"))?;
+
+    if let Some(socket_path) = wayland_socket_path {
+        display_backends.insert(
+            0,
+            virtio::DisplayBackend::Wayland(Some(socket_path.to_owned())),
+        );
+    }
+
+    let dev = virtio::Gpu::new(
+        exit_evt.try_clone().context("failed to clone event")?,
+        Some(gpu_device_tube),
+        resource_bridges,
+        display_backends,
+        cfg.gpu_parameters.as_ref().unwrap(),
+        render_server_fd,
+        event_devices,
+        map_request,
+        cfg.sandbox,
+        virtio::base_features(cfg.protected_vm),
+        cfg.wayland_socket_paths.clone(),
+    );
+
+    let jail = match gpu_jail(cfg, "gpu_device")? {
+        Some(mut jail) => {
+            // Prepare GPU shader disk cache directory.
+            if let Some(cache_dir) = cfg
+                .gpu_parameters
+                .as_ref()
+                .and_then(|params| params.cache_path.as_ref())
+            {
+                if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && cfg.sandbox {
+                    warn!("shader caching not yet supported on ARM with sandbox enabled");
+                    env::set_var("MESA_GLSL_CACHE_DISABLE", "true");
+                } else {
+                    env::set_var("MESA_GLSL_CACHE_DISABLE", "false");
+                    env::set_var("MESA_GLSL_CACHE_DIR", cache_dir);
+                    if let Some(cache_size) = cfg
+                        .gpu_parameters
+                        .as_ref()
+                        .and_then(|params| params.cache_size.as_ref())
+                    {
+                        env::set_var("MESA_GLSL_CACHE_MAX_SIZE", cache_size);
+                    }
+                    let shadercache_path = Path::new(cache_dir);
+                    jail.mount_bind(shadercache_path, shadercache_path, true)?;
+                }
+            }
+
+            // Bind mount the wayland socket's directory into jail's root. This is necessary since
+            // each new wayland context must open() the socket. If the wayland socket is ever
+            // destroyed and remade in the same host directory, new connections will be possible
+            // without restarting the wayland device.
+            for dir in &wayland_socket_dirs {
+                jail.mount_bind(dir, dir, true)?;
+            }
+
+            add_current_user_to_jail(&mut jail)?;
+
             Some(jail)
         }
         None => None,
@@ -872,6 +897,46 @@ fn create_gpu_device(
         dev: Box::new(dev),
         jail,
     })
+}
+
+#[cfg(feature = "gpu")]
+fn start_gpu_render_server(
+    cfg: &Config,
+    render_server_parameters: &GpuRenderServerParameters,
+) -> Result<SafeDescriptor> {
+    let (server_socket, client_socket) =
+        UnixSeqpacket::pair().context("failed to create render server socket")?;
+
+    let jail = match gpu_jail(cfg, "gpu_render_server")? {
+        Some(mut jail) => {
+            // TODO(olv) bind mount and enable shader cache
+
+            // Run as root in the jail to keep capabilities after execve, which is needed for
+            // mounting to work.  All capabilities will be dropped afterwards.
+            add_current_user_as_root_to_jail(&mut jail)?;
+
+            jail
+        }
+        None => Minijail::new().context("failed to create jail")?,
+    };
+
+    let inheritable_fds = [
+        server_socket.as_raw_descriptor(),
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+    ];
+
+    let cmd = &render_server_parameters.path;
+    let cmd_str = cmd
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid render server path"))?;
+    let fd_str = server_socket.as_raw_descriptor().to_string();
+    let args = [cmd_str, "--socket-fd", &fd_str];
+
+    jail.run(cmd, &inheritable_fds, &args)
+        .context("failed to start gpu render server")?;
+
+    Ok(SafeDescriptor::from(client_socket))
 }
 
 fn create_wayland_device(
@@ -1411,7 +1476,7 @@ fn create_virtio_devices(
 
     // We checked above that if the IP is defined, then the netmask is, too.
     for tap_fd in &cfg.tap_fd {
-        devs.push(create_tap_net_device(cfg, *tap_fd)?);
+        devs.push(create_tap_net_device_from_fd(cfg, *tap_fd)?);
     }
 
     if let (Some(host_ip), Some(netmask), Some(mac_address)) =
@@ -1420,7 +1485,16 @@ fn create_virtio_devices(
         if !cfg.vhost_user_net.is_empty() {
             bail!("vhost-user-net cannot be used with any of --host_ip, --netmask or --mac");
         }
-        devs.push(create_net_device(cfg, host_ip, netmask, mac_address)?);
+        devs.push(create_net_device_from_config(
+            cfg,
+            host_ip,
+            netmask,
+            mac_address,
+        )?);
+    }
+
+    for tap_name in &cfg.tap_name {
+        devs.push(create_tap_net_device_from_name(cfg, tap_name.as_bytes())?);
     }
 
     for net in &cfg.vhost_user_net {
@@ -1539,6 +1613,12 @@ fn create_virtio_devices(
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
+
+            let mut render_server_fd = None;
+            if let Some(ref render_server_parameters) = gpu_parameters.render_server {
+                render_server_fd = Some(start_gpu_render_server(cfg, render_server_parameters)?);
+            }
+
             devs.push(create_gpu_device(
                 cfg,
                 _exit_evt,
@@ -1547,6 +1627,7 @@ fn create_virtio_devices(
                 // Use the unnamed socket for GPU display screens.
                 cfg.wayland_socket_paths.get(""),
                 cfg.x_display.clone(),
+                render_server_fd,
                 event_devices,
                 map_request,
             )?);
@@ -1852,6 +1933,20 @@ fn add_current_user_to_jail(jail: &mut Minijail) -> Result<Ids> {
     if crosvm_gid != 0 {
         jail.change_gid(crosvm_gid);
     }
+
+    Ok(Ids {
+        uid: crosvm_uid,
+        gid: crosvm_gid,
+    })
+}
+
+fn add_current_user_as_root_to_jail(jail: &mut Minijail) -> Result<Ids> {
+    let crosvm_uid = geteuid();
+    let crosvm_gid = getegid();
+    jail.uidmap(&format!("0 {0} 1", crosvm_uid))
+        .context("error setting UID map")?;
+    jail.gidmap(&format!("0 {0} 1", crosvm_gid))
+        .context("error setting GID map")?;
 
     Ok(Ids {
         uid: crosvm_uid,

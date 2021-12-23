@@ -944,12 +944,12 @@ fn parse_direct_io_options(s: Option<&str>) -> argument::Result<DirectIoOption> 
                 base,
                 len: last.saturating_sub(base).saturating_add(1),
             }),
-            (Err(e), _) => Err(argument::Error::InvalidValue {
-                value: e.to_string(),
+            (Err(_), _) => Err(argument::Error::InvalidValue {
+                value: s.to_owned(),
                 expected: String::from("invalid base range value"),
             }),
-            (_, Err(e)) => Err(argument::Error::InvalidValue {
-                value: e.to_string(),
+            (_, Err(_)) => Err(argument::Error::InvalidValue {
+                value: s.to_owned(),
                 expected: String::from("invalid last range value"),
             }),
             _ => Err(argument::Error::InvalidValue {
@@ -2278,7 +2278,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
           "[capture=true,client=crosvm,socket=unified,num_output_streams=1,num_input_streams=1]",
           "Comma separated key=value pairs for setting up cras snd devices.
               Possible key values:
-              capture - Enable audio capture.
+              capture - Enable audio capture. Default to false.
               client_type - Set specific client type for cras backend.
               num_output_streams - Set number of output PCM streams
               num_input_streams - Set number of input PCM streams"),
@@ -2364,8 +2364,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                               gidmap=GIDMAP - The gid map to use for the device's jail in the format \"inner outer count[,inner outer count]\" (default: 0 <current egid> 1).
                               cache=(never, auto, always) - Indicates whether the VM can cache the contents of the shared directory (default: auto).  When set to \"auto\" and the type is \"fs\", the VM will use close-to-open consistency for file contents.
                               timeout=SECONDS - How long the VM should consider file attributes and directory entries to be valid (default: 5).  If the VM has exclusive access to the directory, then this should be a large value.  If the directory can be modified by other processes, then this should be 0.
-                              writeback=BOOL - Indicates whether the VM can use writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
-                              dax=BOOL - Indicates whether DAX support should be enabled.  Enabling DAX can improve performance for frequently accessed files by mapping regions of the file directory into the VM's memory, allowing direct access at the cost of slightly increased latency the first time the file is accessed.  Since the mapping is shared directly from the host kernel's file cache, enabling DAX can improve performance even when the cache policy is \"Never\".  The default value for this option is \"false\".
+                              writeback=BOOL - Enables writeback caching (default: false).  This is only safe to do when the VM has exclusive access to the files in a directory.  Additionally, the server should have read permission for all files as the VM may issue read requests even for files that are opened write-only.
+                              dax=BOOL - Enables DAX support.  Enabling DAX can improve performance for frequently accessed files by mapping regions of the file directly into the VM's memory.  There is a cost of slightly increased latency the first time the file is accessed.  Since the mapping is shared directly from the host kernel's file cache, enabling DAX can improve performance even when the guest cache policy is \"Never\".  The default value for this option is \"false\".
                               posix_acl=BOOL - Indicates whether the shared directory supports POSIX ACLs.  This should only be enabled when the underlying file system supports POSIX ACLs.  The default value for this option is \"true\".
 "),
           Argument::value("seccomp-policy-dir", "PATH", "Path to seccomp .policy files."),
@@ -2847,7 +2847,7 @@ fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
     };
 
     result.map_err(|e| {
-        error!("Failed to run {} device: {}", device, e);
+        error!("Failed to run {} device: {:#}", device, e);
     })
 }
 
@@ -3815,7 +3815,14 @@ mod tests {
     #[cfg(feature = "direct")]
     #[test]
     fn parse_direct_io_options_invalid() {
-        let _ = parse_direct_io_options(Some("/dev/mem@0y10"))
-            .expect_err("invalid digit found in string");
+        assert!(parse_direct_io_options(Some("/dev/mem@0y10"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid base range value"));
+
+        assert!(parse_direct_io_options(Some("/dev/mem@"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid base range value"));
     }
 }

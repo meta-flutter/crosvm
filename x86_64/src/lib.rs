@@ -5,7 +5,7 @@
 mod fdt;
 
 const SETUP_DTB: u32 = 2;
-const X86_64_FDT_MAX_SIZE: u64 = 0x200000;
+const X86_64_FDT_MAX_SIZE: u64 = 0x20_0000;
 
 #[allow(dead_code)]
 #[allow(non_upper_case_globals)]
@@ -234,7 +234,6 @@ fn bios_start(bios_size: u64) -> GuestAddress {
 
 fn configure_system(
     guest_mem: &GuestMemory,
-    _mem_size: u64,
     kernel_addr: GuestAddress,
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
@@ -379,7 +378,7 @@ impl arch::LinuxArch for X8664arch {
         let high_mmio_start = Self::get_high_mmio_base(guest_mem);
         let high_mmio_size = Self::get_high_mmio_size(guest_mem);
         SystemAllocator::builder()
-            .add_io_addresses(0xc000, 0x10000)
+            .add_io_addresses(0xc000, 0x1_0000)
             .add_low_mmio_addresses(END_ADDR_BEFORE_32BITS, PCI_MMIO_SIZE)
             .add_high_mmio_addresses(high_mmio_start, high_mmio_size)
             .create_allocator(X86_64_IRQ_BASE)
@@ -570,7 +569,6 @@ impl arch::LinuxArch for X8664arch {
 
                 Self::setup_system_memory(
                     &mem,
-                    components.memory_size,
                     &CString::new(cmdline).unwrap(),
                     components.initrd_image,
                     components.android_fstab,
@@ -1034,7 +1032,6 @@ impl X8664arch {
     /// * `initrd_file` - an initial ramdisk image
     fn setup_system_memory(
         mem: &GuestMemory,
-        mem_size: u64,
         cmdline: &CStr,
         initrd_file: Option<File>,
         android_fstab: Option<File>,
@@ -1092,7 +1089,6 @@ impl X8664arch {
 
         configure_system(
             mem,
-            mem_size,
             GuestAddress(KERNEL_START_OFFSET),
             GuestAddress(CMDLINE_OFFSET),
             cmdline.to_bytes().len() + 1,

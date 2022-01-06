@@ -49,12 +49,13 @@ use devices::virtio::{
 use devices::BusRange;
 #[cfg(feature = "audio")]
 use devices::{Ac97Backend, Ac97Parameters};
-use devices::{PciAddress, PciClassCode, ProtectionType, StubPciParameters};
+use devices::{PciAddress, PciClassCode, StubPciParameters};
 use disk::{self, QcowFile};
 #[cfg(feature = "composite-disk")]
 use disk::{
     create_composite_disk, create_disk_file, create_zero_filler, ImagePartitionType, PartitionInfo,
 };
+use hypervisor::ProtectionType;
 use vm_control::{
     client::{
         do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
@@ -1984,6 +1985,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "protected-vm" => {
             cfg.protected_vm = ProtectionType::Protected;
         }
+        "protected-vm-without-firmware" => {
+            cfg.protected_vm = ProtectionType::ProtectedWithoutFirmware;
+        }
         "battery" => {
             let params = parse_battery_options(value)?;
             cfg.battery_type = Some(params);
@@ -2450,8 +2454,9 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               Possible backend values: libvda"),
           Argument::value("acpi-table", "PATH", "Path to user provided ACPI table"),
           Argument::flag("protected-vm", "(EXPERIMENTAL) prevent host access to guest memory"),
+          Argument::flag("protected-vm-without-firmware", "(EXPERIMENTAL) prevent host access to guest memory, but don't use protected VM firmware"),
           #[cfg(target_arch = "aarch64")]
-          Argument::value("swiotlb", "N", "(EXPERIMENTAL) Size of virtio swiotlb buffer in MiB (default: 64 if `--protected-vm` is present)."),
+          Argument::value("swiotlb", "N", "(EXPERIMENTAL) Size of virtio swiotlb buffer in MiB (default: 64 if `--protected-vm` or `--protected-vm-without-firmware` is present)."),
           Argument::flag_or_value("battery",
                                   "[type=TYPE]",
                                   "Comma separated key=value pairs for setting up battery device

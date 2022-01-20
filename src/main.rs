@@ -33,6 +33,8 @@ use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
 use devices::virtio::gpu::GpuRenderServerParameters;
 #[cfg(feature = "audio_cras")]
 use devices::virtio::snd::cras_backend::Error as CrasSndError;
+#[cfg(feature = "audio_cras")]
+use devices::virtio::vhost::user::device::run_cras_snd_device;
 use devices::virtio::vhost::user::device::{
     run_block_device, run_console_device, run_fs_device, run_net_device, run_vsock_device,
     run_wl_device,
@@ -557,6 +559,8 @@ fn parse_gpu_render_server_options(
     gpu_params: &mut GpuParameters,
 ) -> argument::Result<()> {
     let mut path: Option<PathBuf> = None;
+    let mut cache_path = None;
+    let mut cache_size = None;
 
     if let Some(s) = s {
         let opts = s
@@ -575,6 +579,8 @@ fn parse_gpu_render_server_options(
                             })?,
                         )
                 }
+                "cache-path" => cache_path = Some(v.to_string()),
+                "cache-size" => cache_size = Some(v.to_string()),
                 "" => {}
                 _ => {
                     return Err(argument::Error::UnknownArgument(format!(
@@ -587,7 +593,11 @@ fn parse_gpu_render_server_options(
     }
 
     if let Some(p) = path {
-        gpu_params.render_server = Some(GpuRenderServerParameters { path: p });
+        gpu_params.render_server = Some(GpuRenderServerParameters {
+            path: p,
+            cache_path,
+            cache_size,
+        });
         Ok(())
     } else {
         Err(argument::Error::InvalidValue {
@@ -2421,7 +2431,9 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                               surfaceless[=true|=false] - If the backend should use a surfaceless context for rendering.
                               angle[=true|=false] - If the gfxstream backend should use ANGLE (OpenGL on Vulkan) as its native OpenGL driver.
                               syncfd[=true|=false] - If the gfxstream backend should support EGL_ANDROID_native_fence_sync
-                              vulkan[=true|=false] - If the backend should support vulkan"),
+                              vulkan[=true|=false] - If the backend should support vulkan
+                              cache-path=PATH - The path to the virtio-gpu device shader cache.
+                              cache-size=SIZE - The maximum size of the shader cache."),
           #[cfg(feature = "gpu")]
           Argument::flag_or_value("gpu-display",
                                   "[width=INT,height=INT]",
@@ -2434,7 +2446,9 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                                   "[path=PATH]",
                                   "(EXPERIMENTAL) Comma separated key=value pairs for setting up a render server for the virtio-gpu device
                               Possible key values:
-                              path=PATH - The path to the render server executable."),
+                              path=PATH - The path to the render server executable.
+                              cache-path=PATH - The path to the render server shader cache.
+                              cache-size=SIZE - The maximum size of the shader cache."),
           #[cfg(feature = "tpm")]
           Argument::flag("software-tpm", "enable a software emulated trusted platform module device"),
           Argument::value("evdev", "PATH", "Path to an event device node. The device will be grabbed (unusable from the host) and made available to the guest with the same configuration it shows on the host"),
@@ -2838,7 +2852,7 @@ fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let print_usage = || {
         print_help(
             "crosvm device",
-            " (block|console|fs|gpu|net|wl) <device-specific arguments>",
+            " (block|console|cras-snd|fs|gpu|net|wl) <device-specific arguments>",
             &[],
         );
     };
@@ -2859,6 +2873,8 @@ fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let result = match device.as_str() {
         "block" => run_block_device(&program_name, args),
         "console" => run_console_device(&program_name, args),
+        #[cfg(feature = "audio_cras")]
+        "cras-snd" => run_cras_snd_device(&program_name, args),
         "fs" => run_fs_device(&program_name, args),
         #[cfg(feature = "gpu")]
         "gpu" => run_gpu_device(&program_name, args),

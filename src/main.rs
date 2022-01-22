@@ -2169,6 +2169,63 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "vvu-proxy" => cfg.vvu_proxy.push(VhostUserOption {
             socket: PathBuf::from(value.unwrap()),
         }),
+        "coiommu" => {
+            let mut params: devices::CoIommuParameters = Default::default();
+            if let Some(v) = value {
+                let opts = v
+                    .split(',')
+                    .map(|frag| frag.splitn(2, '='))
+                    .map(|mut kv| (kv.next().unwrap_or(""), kv.next().unwrap_or("")));
+
+                for (k, v) in opts {
+                    match k {
+                        "unpin_policy" => {
+                            params.unpin_policy = v
+                                .parse::<devices::CoIommuUnpinPolicy>()
+                                .map_err(|e| argument::Error::UnknownArgument(format!("{}", e)))?
+                        }
+                        "unpin_interval" => {
+                            params.unpin_interval =
+                                Duration::from_secs(v.parse::<u64>().map_err(|e| {
+                                    argument::Error::UnknownArgument(format!("{}", e))
+                                })?)
+                        }
+                        "unpin_limit" => {
+                            let limit = v
+                                .parse::<u64>()
+                                .map_err(|e| argument::Error::UnknownArgument(format!("{}", e)))?;
+
+                            if limit == 0 {
+                                return Err(argument::Error::InvalidValue {
+                                    value: v.to_owned(),
+                                    expected: String::from("Please use non-zero unpin_limit value"),
+                                });
+                            }
+
+                            params.unpin_limit = Some(limit)
+                        }
+                        "unpin_gen_threshold" => {
+                            params.unpin_gen_threshold = v
+                                .parse::<u64>()
+                                .map_err(|e| argument::Error::UnknownArgument(format!("{}", e)))?
+                        }
+                        _ => {
+                            return Err(argument::Error::UnknownArgument(format!(
+                                "coiommu parameter {}",
+                                k
+                            )));
+                        }
+                    }
+                }
+            }
+
+            if cfg.coiommu_param.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "coiommu param already given".to_owned(),
+                ));
+            }
+            cfg.coiommu_param = Some(params);
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -2512,6 +2569,14 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               subsystem_vendor=NUM - PCI subsystem vendor ID
                               subsystem_device=NUM - PCI subsystem device ID
                               revision=NUM - revision"),
+          Argument::flag_or_value("coiommu",
+                          "unpin_policy=POLICY,unpin_interval=NUM,unpin_limit=NUM,unpin_gen_threshold=NUM ",
+                          "Comma separated key=value pairs for setting up coiommu devices.
+                              Possible key values:
+                              unpin_policy=lru - LRU unpin policy.
+                              unpin_interval=NUM - Unpin interval time in seconds.
+                              unpin_limit=NUM - Unpin limit for each unpin cycle, in unit of page count. 0 is invalid.
+                              unpin_gen_threshold=NUM -  Number of unpin intervals a pinned page must be busy for to be aged into the older which is less frequently checked generation."),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2660,6 +2725,42 @@ fn modify_battery(mut args: std::env::Args) -> std::result::Result<(), ()> {
     let socket_path = Path::new(&socket_path);
 
     do_modify_battery(socket_path, &*battery_type, &*property, &*target)
+}
+
+fn modify_vfio(mut args: std::env::Args) -> std::result::Result<(), ()> {
+    if args.len() < 3 {
+        print_help(
+            "crosvm vfio",
+            "[add | remove host_vfio_sysfs] VM_SOCKET...",
+            &[],
+        );
+        return Err(());
+    }
+
+    // This unwrap will not panic because of the above length check.
+    let command = args.next().unwrap();
+    let path_str = args.next().unwrap();
+    let vfio_path = PathBuf::from(&path_str);
+    if !vfio_path.exists() || !vfio_path.is_dir() {
+        error!("Invalid host sysfs path: {}", path_str);
+        return Err(());
+    }
+
+    let socket_path = args.next().unwrap();
+    let socket_path = Path::new(&socket_path);
+
+    let add = match command.as_ref() {
+        "add" => true,
+        "remove" => false,
+        other => {
+            error!("Invalid vfio command {}", other);
+            return Err(());
+        }
+    };
+
+    let request = VmRequest::VfioCommand { vfio_path, add };
+    handle_request(&request, socket_path)?;
+    Ok(())
 }
 
 #[cfg(feature = "composite-disk")]
@@ -3070,6 +3171,7 @@ fn print_usage() {
     println!("    suspend - Suspends the crosvm instance.");
     println!("    usb - Manage attached virtual USB devices.");
     println!("    version - Show package version.");
+    println!("    vfio - add/remove host vfio pci device into guest.");
 }
 
 fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
@@ -3124,6 +3226,7 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
             "suspend" => suspend_vms(args),
             "usb" => modify_usb(args),
             "version" => pkg_version(),
+            "vfio" => modify_vfio(args),
             c => {
                 println!("invalid subcommand: {:?}", c);
                 print_usage();

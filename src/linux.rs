@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::TryFrom;
 #[cfg(feature = "gpu")]
 use std::env;
@@ -839,6 +839,45 @@ fn gpu_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
 }
 
 #[cfg(feature = "gpu")]
+struct GpuCacheInfo<'a> {
+    directory: Option<&'a str>,
+    environment: Vec<(&'a str, &'a str)>,
+}
+
+#[cfg(feature = "gpu")]
+fn get_gpu_cache_info<'a>(
+    cache_dir: Option<&'a String>,
+    cache_size: Option<&'a String>,
+    sandbox: bool,
+) -> GpuCacheInfo<'a> {
+    let mut dir = None;
+    let mut env = Vec::new();
+
+    if let Some(cache_dir) = cache_dir {
+        if !Path::new(cache_dir).exists() {
+            warn!("shader caching dir {} does not exist", cache_dir);
+            env.push(("MESA_GLSL_CACHE_DISABLE", "true"));
+        } else if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && sandbox {
+            warn!("shader caching not yet supported on ARM with sandbox enabled");
+            env.push(("MESA_GLSL_CACHE_DISABLE", "true"));
+        } else {
+            dir = Some(cache_dir.as_str());
+
+            env.push(("MESA_GLSL_CACHE_DISABLE", "false"));
+            env.push(("MESA_GLSL_CACHE_DIR", cache_dir.as_str()));
+            if let Some(cache_size) = cache_size {
+                env.push(("MESA_GLSL_CACHE_MAX_SIZE", cache_size.as_str()));
+            }
+        }
+    }
+
+    GpuCacheInfo {
+        directory: dir,
+        environment: env,
+    }
+}
+
+#[cfg(feature = "gpu")]
 fn create_gpu_device(
     cfg: &Config,
     exit_evt: &Event,
@@ -886,27 +925,18 @@ fn create_gpu_device(
     let jail = match gpu_jail(cfg, "gpu_device")? {
         Some(mut jail) => {
             // Prepare GPU shader disk cache directory.
-            if let Some(cache_dir) = cfg
+            let (cache_dir, cache_size) = cfg
                 .gpu_parameters
                 .as_ref()
-                .and_then(|params| params.cache_path.as_ref())
-            {
-                if cfg!(any(target_arch = "arm", target_arch = "aarch64")) && cfg.sandbox {
-                    warn!("shader caching not yet supported on ARM with sandbox enabled");
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "true");
-                } else {
-                    env::set_var("MESA_GLSL_CACHE_DISABLE", "false");
-                    env::set_var("MESA_GLSL_CACHE_DIR", cache_dir);
-                    if let Some(cache_size) = cfg
-                        .gpu_parameters
-                        .as_ref()
-                        .and_then(|params| params.cache_size.as_ref())
-                    {
-                        env::set_var("MESA_GLSL_CACHE_MAX_SIZE", cache_size);
-                    }
-                    let shadercache_path = Path::new(cache_dir);
-                    jail.mount_bind(shadercache_path, shadercache_path, true)?;
-                }
+                .map(|params| (params.cache_path.as_ref(), params.cache_size.as_ref()))
+                .unwrap();
+            let cache_info = get_gpu_cache_info(cache_dir, cache_size, cfg.sandbox);
+
+            if let Some(dir) = cache_info.directory {
+                jail.mount_bind(dir, dir, true)?;
+            }
+            for (key, val) in cache_info.environment {
+                env::set_var(key, val);
             }
 
             // Bind mount the wayland socket's directory into jail's root. This is necessary since
@@ -931,6 +961,30 @@ fn create_gpu_device(
 }
 
 #[cfg(feature = "gpu")]
+fn get_gpu_render_server_environment(cache_info: &GpuCacheInfo) -> Result<Vec<String>> {
+    let mut env = Vec::new();
+
+    let mut cache_env_keys = HashSet::with_capacity(cache_info.environment.len());
+    for (key, val) in cache_info.environment.iter() {
+        env.push(format!("{}={}", key, val));
+        cache_env_keys.insert(*key);
+    }
+
+    for (key_os, val_os) in env::vars_os() {
+        // minijail should accept OsStr rather than str...
+        let into_string_err = |_| anyhow!("invalid environment key/val");
+        let key = key_os.into_string().map_err(into_string_err)?;
+        let val = val_os.into_string().map_err(into_string_err)?;
+
+        if !cache_env_keys.contains(key.as_str()) {
+            env.push(format!("{}={}", key, val));
+        }
+    }
+
+    Ok(env)
+}
+
+#[cfg(feature = "gpu")]
 fn start_gpu_render_server(
     cfg: &Config,
     render_server_parameters: &GpuRenderServerParameters,
@@ -938,9 +992,22 @@ fn start_gpu_render_server(
     let (server_socket, client_socket) =
         UnixSeqpacket::pair().context("failed to create render server socket")?;
 
+    let mut env = None;
     let jail = match gpu_jail(cfg, "gpu_render_server")? {
         Some(mut jail) => {
-            // TODO(olv) bind mount and enable shader cache
+            let cache_info = get_gpu_cache_info(
+                render_server_parameters.cache_path.as_ref(),
+                render_server_parameters.cache_size.as_ref(),
+                cfg.sandbox,
+            );
+
+            if let Some(dir) = cache_info.directory {
+                jail.mount_bind(dir, dir, true)?;
+            }
+
+            if !cache_info.environment.is_empty() {
+                env = Some(get_gpu_render_server_environment(&cache_info)?);
+            }
 
             // bind mount /dev/log for syslog
             let log_path = Path::new("/dev/log");
@@ -970,8 +1037,18 @@ fn start_gpu_render_server(
     let fd_str = server_socket.as_raw_descriptor().to_string();
     let args = [cmd_str, "--socket-fd", &fd_str];
 
-    jail.run(cmd, &inheritable_fds, &args)
-        .context("failed to start gpu render server")?;
+    let mut envp: Option<Vec<&str>> = None;
+    if let Some(ref env) = env {
+        envp = Some(env.iter().map(AsRef::as_ref).collect());
+    }
+
+    jail.run_command(minijail::Command::new_for_path(
+        cmd,
+        &inheritable_fds,
+        &args,
+        envp.as_deref(),
+    )?)
+    .context("failed to start gpu render server")?;
 
     Ok(SafeDescriptor::from(client_socket))
 }

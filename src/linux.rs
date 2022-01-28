@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cmp::Reverse;
+use std::cmp::{max, Reverse};
 use std::collections::{BTreeMap, HashSet};
 use std::convert::TryFrom;
 #[cfg(feature = "gpu")]
@@ -57,6 +57,7 @@ use devices::{
     PciAddress, PciBridge, PciDevice, PcieRootPort, StubPciDevice, VcpuRunState, VfioContainer,
     VfioDevice, VfioPciDevice, VfioPlatformDevice, VirtioPciDevice,
 };
+use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
 use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
@@ -594,8 +595,8 @@ fn create_vinput_device(cfg: &Config, dev_path: &Path) -> DeviceResult {
     })
 }
 
-fn create_balloon_device(cfg: &Config, tube: Tube) -> DeviceResult {
-    let dev = virtio::Balloon::new(virtio::base_features(cfg.protected_vm), tube)
+fn create_balloon_device(cfg: &Config, tube: Tube, inflate_tube: Option<Tube>) -> DeviceResult {
+    let dev = virtio::Balloon::new(virtio::base_features(cfg.protected_vm), tube, inflate_tube)
         .context("failed to create balloon")?;
 
     Ok(VirtioDeviceStub {
@@ -1493,6 +1494,7 @@ fn create_virtio_devices(
     gpu_device_tube: Tube,
     vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
     balloon_device_tube: Tube,
+    balloon_inflate_tube: Option<Tube>,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
@@ -1579,7 +1581,11 @@ fn create_virtio_devices(
         devs.push(create_vinput_device(cfg, dev_path)?);
     }
 
-    devs.push(create_balloon_device(cfg, balloon_device_tube)?);
+    devs.push(create_balloon_device(
+        cfg,
+        balloon_device_tube,
+        balloon_inflate_tube,
+    )?);
 
     // We checked above that if the IP is defined, then the netmask is, too.
     for tap_fd in &cfg.tap_fd {
@@ -1834,10 +1840,11 @@ fn create_vfio_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     bus_num: Option<u8>,
-    endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
-    iommu_enabled: bool,
+    iommu_endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
+    coiommu_endpoints: Option<&mut Vec<u16>>,
+    iommu_dev: IommuDevType,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
-    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+    let vfio_container = VfioCommonSetup::vfio_get_container(iommu_dev, Some(vfio_path))
         .context("failed to get vfio container")?;
 
     // create MSI, MSI-X, and Mem request sockets for each vfio device
@@ -1854,28 +1861,46 @@ fn create_vfio_device(
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
     let hotplug = bus_num.is_some();
+    let vfio_device_tube_vm = if hotplug {
+        let (vfio_host_tube_vm, device_tube_vm) = Tube::pair().context("failed to create tube")?;
+        control_tubes.push(TaggedControlTube::Vm(vfio_host_tube_vm));
+        Some(device_tube_vm)
+    } else {
+        None
+    };
 
-    let vfio_device =
-        VfioDevice::new_passthrough(&vfio_path, vm, vfio_container.clone(), iommu_enabled)
-            .context("failed to create vfio device")?;
+    let vfio_device = VfioDevice::new_passthrough(
+        &vfio_path,
+        vm,
+        vfio_container.clone(),
+        iommu_dev != IommuDevType::NoIommu,
+    )
+    .context("failed to create vfio device")?;
     let mut vfio_pci_device = Box::new(VfioPciDevice::new(
         vfio_device,
         bus_num,
         vfio_device_tube_msi,
         vfio_device_tube_msix,
         vfio_device_tube_mem,
+        vfio_device_tube_vm,
     ));
     // early reservation for pass-through PCI devices.
-    let endpoint_addr = vfio_pci_device.allocate_address(resources);
-    if endpoint_addr.is_err() {
-        warn!(
-            "address reservation failed for vfio {}",
-            vfio_pci_device.debug_label()
-        );
-    }
+    let endpoint_addr = vfio_pci_device
+        .allocate_address(resources)
+        .context("failed to allocate resources early for vfio pci dev")?;
 
-    if iommu_enabled {
-        endpoints.insert(endpoint_addr.unwrap().to_u32(), vfio_container);
+    match iommu_dev {
+        IommuDevType::NoIommu => {}
+        IommuDevType::VirtioIommu => {
+            iommu_endpoints.insert(endpoint_addr.to_u32(), vfio_container);
+        }
+        IommuDevType::CoIommu => {
+            if let Some(endpoints) = coiommu_endpoints {
+                endpoints.push(endpoint_addr.to_u32() as u16);
+            } else {
+                bail!("Missed coiommu_endpoints vector to store the endpoint addr");
+            }
+        }
     }
 
     if hotplug {
@@ -1892,17 +1917,22 @@ fn create_vfio_platform_device(
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     _endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
-    iommu_enabled: bool,
+    iommu_dev: IommuDevType,
 ) -> DeviceResult<(VfioPlatformDevice, Option<Minijail>)> {
-    let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
+    let vfio_container = VfioCommonSetup::vfio_get_container(iommu_dev, Some(vfio_path))
         .context("Failed to create vfio device")?;
 
     let (vfio_host_tube_mem, vfio_device_tube_mem) =
         Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(vfio_host_tube_mem));
 
-    let vfio_device = VfioDevice::new_passthrough(&vfio_path, vm, vfio_container, iommu_enabled)
-        .context("Failed to create vfio device")?;
+    let vfio_device = VfioDevice::new_passthrough(
+        &vfio_path,
+        vm,
+        vfio_container,
+        iommu_dev != IommuDevType::NoIommu,
+    )
+    .context("Failed to create vfio device")?;
     let vfio_plat_dev = VfioPlatformDevice::new(vfio_device, vfio_device_tube_mem);
 
     Ok((vfio_plat_dev, simple_jail(cfg, "vfio_platform_device")?))
@@ -1925,6 +1955,118 @@ fn create_devices(
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
+    let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
+    let mut balloon_inflate_tube: Option<Tube> = None;
+    if !cfg.vfio.is_empty() {
+        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
+            BTreeMap::new();
+        let mut coiommu_attached_endpoints = Vec::new();
+
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Pci)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
+            let (vfio_pci_device, jail) = create_vfio_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                None,
+                &mut iommu_attached_endpoints,
+                Some(&mut coiommu_attached_endpoints),
+                vfio_dev.iommu_dev_type(),
+            )?;
+
+            devices.push((vfio_pci_device, jail));
+        }
+
+        for vfio_dev in cfg
+            .vfio
+            .iter()
+            .filter(|dev| dev.get_type() == VfioType::Platform)
+        {
+            let vfio_path = &vfio_dev.vfio_path;
+            let (vfio_plat_dev, jail) = create_vfio_platform_device(
+                cfg,
+                vm,
+                resources,
+                control_tubes,
+                vfio_path.as_path(),
+                &mut iommu_attached_endpoints,
+                IommuDevType::NoIommu, // Virtio IOMMU is not supported yet
+            )?;
+
+            devices.push((Box::new(vfio_plat_dev), jail));
+        }
+
+        if !coiommu_attached_endpoints.is_empty() || !iommu_attached_endpoints.is_empty() {
+            let mut buf = mem::MaybeUninit::<libc::rlimit>::zeroed();
+            let res = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, buf.as_mut_ptr()) };
+            if res == 0 {
+                let limit = unsafe { buf.assume_init() };
+                let rlim_new = limit
+                    .rlim_cur
+                    .saturating_add(vm.get_memory().memory_size() as libc::rlim_t);
+                let rlim_max = max(limit.rlim_max, rlim_new);
+                if limit.rlim_cur < rlim_new {
+                    let limit_arg = libc::rlimit {
+                        rlim_cur: rlim_new as libc::rlim_t,
+                        rlim_max: rlim_max as libc::rlim_t,
+                    };
+                    let res = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit_arg) };
+                    if res != 0 {
+                        bail!("Set rlimit failed");
+                    }
+                }
+            } else {
+                bail!("Get rlimit failed");
+            }
+        }
+
+        if !iommu_attached_endpoints.is_empty() {
+            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
+
+            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+            let mut dev =
+                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+                    .context("failed to create virtio pci dev")?;
+            // early reservation for viommu.
+            dev.allocate_address(resources)
+                .context("failed to allocate resources early for virtio pci dev")?;
+            let dev = Box::new(dev);
+            devices.push((dev, iommu_dev.jail));
+        }
+
+        if !coiommu_attached_endpoints.is_empty() {
+            let vfio_container =
+                VfioCommonSetup::vfio_get_container(IommuDevType::CoIommu, None as Option<&Path>)
+                    .context("failed to get vfio container")?;
+            let (coiommu_host_tube, coiommu_device_tube) =
+                Tube::pair().context("failed to create coiommu tube")?;
+            control_tubes.push(TaggedControlTube::VmMemory(coiommu_host_tube));
+            let vcpu_count = cfg.vcpu_count.unwrap_or(1) as u64;
+            let (coiommu_tube, balloon_tube) =
+                Tube::pair().context("failed to create coiommu tube")?;
+            balloon_inflate_tube = Some(balloon_tube);
+            let dev = CoIommuDev::new(
+                vm.get_memory().clone(),
+                vfio_container,
+                coiommu_device_tube,
+                coiommu_tube,
+                coiommu_attached_endpoints,
+                vcpu_count,
+                cfg.coiommu_param.unwrap_or_default(),
+            )
+            .context("failed to create coiommu device")?;
+
+            devices.push((Box::new(dev), simple_jail(cfg, "coiommu")?));
+        }
+    }
+
     let stubs = create_virtio_devices(
         cfg,
         vm,
@@ -1934,13 +2076,12 @@ fn create_devices(
         gpu_device_tube,
         vhost_user_gpu_tubes,
         balloon_device_tube,
+        balloon_inflate_tube,
         disk_device_tubes,
         pmem_device_tubes,
         map_request,
         fs_device_tubes,
     )?;
-
-    let mut devices = Vec::new();
 
     for stub in stubs {
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1964,65 +2105,6 @@ fn create_devices(
         // Create xhci controller.
         let usb_controller = Box::new(XhciController::new(vm.get_memory().clone(), usb_provider));
         devices.push((usb_controller, simple_jail(cfg, "xhci")?));
-    }
-
-    if !cfg.vfio.is_empty() {
-        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
-            BTreeMap::new();
-
-        for vfio_dev in cfg
-            .vfio
-            .iter()
-            .filter(|dev| dev.get_type() == VfioType::Pci)
-        {
-            let vfio_path = &vfio_dev.vfio_path;
-            let (vfio_pci_device, jail) = create_vfio_device(
-                cfg,
-                vm,
-                resources,
-                control_tubes,
-                vfio_path.as_path(),
-                None,
-                &mut iommu_attached_endpoints,
-                vfio_dev.iommu_enabled(),
-            )?;
-
-            devices.push((vfio_pci_device, jail));
-        }
-
-        for vfio_dev in cfg
-            .vfio
-            .iter()
-            .filter(|dev| dev.get_type() == VfioType::Platform)
-        {
-            let vfio_path = &vfio_dev.vfio_path;
-            let (vfio_plat_dev, jail) = create_vfio_platform_device(
-                cfg,
-                vm,
-                resources,
-                control_tubes,
-                vfio_path.as_path(),
-                &mut iommu_attached_endpoints,
-                false, // Virtio IOMMU is not supported yet
-            )?;
-
-            devices.push((Box::new(vfio_plat_dev), jail));
-        }
-
-        if !iommu_attached_endpoints.is_empty() {
-            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
-
-            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-            let mut dev =
-                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-                    .context("failed to create virtio pci dev")?;
-            // early reservation for viommu.
-            dev.allocate_address(resources)
-                .context("failed to allocate resources early for virtio pci dev")?;
-            let dev = Box::new(dev);
-            devices.push((dev, iommu_dev.jail));
-        }
     }
 
     for params in &cfg.stub_pci_devices {
@@ -3035,6 +3117,7 @@ where
     run_control(
         linux,
         sys_allocator,
+        cfg,
         control_server_socket,
         control_tubes,
         balloon_host_tube,
@@ -3044,11 +3127,8 @@ where
         exit_evt,
         reset_evt,
         sigchld_fd,
-        cfg.sandbox,
         Arc::clone(&map_request),
         gralloc,
-        cfg.per_vm_core_scheduling,
-        cfg.host_cpu_topology,
         kvm_vcpu_ids,
     )
 }
@@ -3065,7 +3145,6 @@ fn get_hp_bus<V: VmArch, Vcpu: VcpuArch>(
     Err(anyhow!("Failed to find a suitable hotplug bus"))
 }
 
-#[allow(dead_code)]
 fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
@@ -3092,7 +3171,8 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
         vfio_path,
         Some(bus_num),
         &mut endpoints,
-        false,
+        None,
+        IommuDevType::NoIommu,
     )?;
 
     let pci_address = Arch::register_pci_device(linux, vfio_pci_device, jail, sys_allocator)
@@ -3112,7 +3192,6 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &RunnableLinuxVm<V, Vcpu>,
     sys_allocator: &mut SystemAllocator,
@@ -3138,6 +3217,30 @@ fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     Err(anyhow!("HotPlugBus hasn't been implemented"))
 }
 
+fn handle_vfio_command<V: VmArch, Vcpu: VcpuArch>(
+    linux: &mut RunnableLinuxVm<V, Vcpu>,
+    sys_allocator: &mut SystemAllocator,
+    cfg: &Config,
+    add_tubes: &mut Vec<TaggedControlTube>,
+    vfio_path: &Path,
+    add: bool,
+) -> VmResponse {
+    let ret = if add {
+        add_vfio_device(linux, sys_allocator, cfg, add_tubes, vfio_path)
+    } else {
+        remove_vfio_device(linux, sys_allocator, vfio_path)
+    };
+
+    match ret {
+        Ok(()) => VmResponse::Ok,
+        Err(e) => {
+            error!("hanlde_vfio_command failure: {}", e);
+            add_tubes.clear();
+            VmResponse::Err(base::Error::new(libc::EINVAL))
+        }
+    }
+}
+
 /// Signals all running VCPUs to vmexit, sends VcpuControl message to each VCPU tube, and tells
 /// `irq_chip` to stop blocking halted VCPUs. The channel message is set first because both the
 /// signal and the irq_chip kick could cause the VCPU thread to continue through the VCPU run
@@ -3159,6 +3262,7 @@ fn kick_all_vcpus(
 fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     mut linux: RunnableLinuxVm<V, Vcpu>,
     mut sys_allocator: SystemAllocator,
+    cfg: Config,
     control_server_socket: Option<UnlinkUnixSeqpacketListener>,
     mut control_tubes: Vec<TaggedControlTube>,
     balloon_host_tube: Tube,
@@ -3167,11 +3271,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     exit_evt: Event,
     reset_evt: Event,
     sigchld_fd: SignalFd,
-    sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
-    enable_per_vm_core_scheduling: bool,
-    host_cpu_topology: bool,
     kvm_vcpu_ids: Vec<usize>,
 ) -> Result<ExitState> {
     #[derive(PollToken)]
@@ -3219,7 +3320,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .context("failed to add descriptor to wait context")?;
     }
 
-    if sandbox {
+    if cfg.sandbox {
         // Before starting VCPUs, in case we started with some capabilities, drop them all.
         drop_capabilities().context("failed to drop process capabilities")?;
     }
@@ -3249,7 +3350,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // shared by all vCPU threads.
     // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
     // itself for even better performance. Only vCPUs need the feature.
-    if enable_per_vm_core_scheduling {
+    if cfg.per_vm_core_scheduling {
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
@@ -3285,8 +3386,8 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             use_hypervisor_signals,
             #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
             to_gdb_channel.clone(),
-            enable_per_vm_core_scheduling,
-            host_cpu_topology,
+            cfg.per_vm_core_scheduling,
+            cfg.host_cpu_topology,
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -3391,23 +3492,37 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     }
                 }
                 Token::VmControl { index } => {
+                    let mut add_tubes = Vec::new();
                     if let Some(socket) = control_tubes.get(index) {
                         match socket {
                             TaggedControlTube::Vm(tube) => match tube.recv::<VmRequest>() {
                                 Ok(request) => {
                                     let mut run_mode_opt = None;
-                                    let response = request.execute(
-                                        &mut run_mode_opt,
-                                        &balloon_host_tube,
-                                        &mut balloon_stats_id,
-                                        disk_host_tubes,
-                                        #[cfg(feature = "usb")]
-                                        Some(&usb_control_tube),
-                                        #[cfg(not(feature = "usb"))]
-                                        None,
-                                        &mut linux.bat_control,
-                                        &vcpu_handles,
-                                    );
+                                    let response = match request {
+                                        VmRequest::VfioCommand { vfio_path, add } => {
+                                            handle_vfio_command(
+                                                &mut linux,
+                                                &mut sys_allocator,
+                                                &cfg,
+                                                &mut add_tubes,
+                                                &vfio_path,
+                                                add,
+                                            )
+                                        }
+                                        _ => request.execute(
+                                            &mut run_mode_opt,
+                                            &balloon_host_tube,
+                                            &mut balloon_stats_id,
+                                            disk_host_tubes,
+                                            #[cfg(feature = "usb")]
+                                            Some(&usb_control_tube),
+                                            #[cfg(not(feature = "usb"))]
+                                            None,
+                                            &mut linux.bat_control,
+                                            &vcpu_handles,
+                                        ),
+                                    };
+
                                     if let Err(e) = tube.send(&response) {
                                         error!("failed to send VmResponse: {}", e);
                                     }
@@ -3542,6 +3657,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                 }
                             },
                         }
+                    }
+                    if !add_tubes.is_empty() {
+                        for (idx, socket) in add_tubes.iter().enumerate() {
+                            wait_ctx
+                                .add(
+                                    socket.as_ref(),
+                                    Token::VmControl {
+                                        index: idx + control_tubes.len(),
+                                    },
+                                )
+                                .context(
+                                    "failed to add hotplug vfio-pci descriptor ot wait context",
+                                )?;
+                        }
+                        control_tubes.append(&mut add_tubes);
                     }
                 }
             }

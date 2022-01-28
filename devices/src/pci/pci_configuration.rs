@@ -10,7 +10,7 @@ use remain::sorted;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::pci::PciInterruptPin;
+use crate::pci::{PciAddress, PciInterruptPin};
 
 // The number of 32bit registers in the config space, 256 bytes.
 const NUM_CONFIGURATION_REGISTERS: usize = 64;
@@ -20,6 +20,8 @@ pub const COMMAND_REG_IO_SPACE_MASK: u32 = 0x0000_0001;
 pub const COMMAND_REG_MEMORY_SPACE_MASK: u32 = 0x0000_0002;
 const STATUS_REG: usize = 1;
 const STATUS_REG_CAPABILITIES_USED_MASK: u32 = 0x0010_0000;
+pub const HEADER_TYPE_REG: usize = 3;
+pub const HEADER_TYPE_MULTIFUNCTION_MASK: u32 = 0x0080_0000;
 pub const BAR0_REG: usize = 4;
 const BAR_IO_ADDR_MASK: u32 = 0xffff_fffc;
 const BAR_IO_MIN_SIZE: u64 = 4;
@@ -309,7 +311,6 @@ impl PciConfiguration {
         subclass: &dyn PciSubclass,
         programming_interface: Option<&dyn PciProgrammingInterface>,
         header_type: PciHeaderType,
-        multifunction: bool,
         subsystem_vendor_id: u16,
         subsystem_id: u16,
         revision_id: u8,
@@ -350,10 +351,6 @@ impl PciConfiguration {
                 writable_bits[15] = 0xffff_00ff; // Bridge control (r/w), interrupt line (r/w)
             }
         };
-        // Multifunction is indicated by the highest bit in the header_type field.
-        if multifunction {
-            registers[3] |= 0x0080_0000;
-        }
 
         PciConfiguration {
             registers,
@@ -646,6 +643,15 @@ impl PciConfiguration {
         let next = offset + len;
         (next + 3) & !3
     }
+
+    pub fn suggested_interrupt_pin(pci_address: PciAddress) -> PciInterruptPin {
+        match pci_address.func % 4 {
+            0 => PciInterruptPin::IntA,
+            1 => PciInterruptPin::IntB,
+            2 => PciInterruptPin::IntC,
+            _ => PciInterruptPin::IntD,
+        }
+    }
 }
 
 impl PciBarConfiguration {
@@ -751,7 +757,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             None,
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -814,7 +819,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -830,24 +834,6 @@ mod tests {
     }
 
     #[test]
-    fn multifunction() {
-        let cfg = PciConfiguration::new(
-            0x1234,
-            0x5678,
-            PciClassCode::MultimediaController,
-            &PciMultimediaSubclass::AudioController,
-            Some(&TestPI::Test),
-            PciHeaderType::Device,
-            true,
-            0xABCD,
-            0x2468,
-            0,
-        );
-
-        assert!((cfg.read_reg(3) & 0x0080_0000) != 0);
-    }
-
-    #[test]
     fn read_only_bits() {
         let mut cfg = PciConfiguration::new(
             0x1234,
@@ -856,7 +842,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -877,7 +862,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -900,7 +884,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -948,7 +931,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -995,7 +977,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -1039,7 +1020,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -1162,7 +1142,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,
@@ -1220,7 +1199,6 @@ mod tests {
             &PciMultimediaSubclass::AudioController,
             Some(&TestPI::Test),
             PciHeaderType::Device,
-            false,
             0xABCD,
             0x2468,
             0,

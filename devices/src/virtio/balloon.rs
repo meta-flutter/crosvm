@@ -12,10 +12,10 @@ use futures::{channel::mpsc, pin_mut, StreamExt};
 use remain::sorted;
 use thiserror::Error as ThisError;
 
+use balloon_control::{BalloonStats, BalloonTubeCommand, BalloonTubeResult};
 use base::{self, error, warn, AsRawDescriptor, AsyncTube, Event, RawDescriptor, Tube};
 use cros_async::{select6, EventAsync, Executor};
 use data_model::{DataInit, Le16, Le32, Le64};
-use vm_control::{BalloonStats, BalloonTubeCommand, BalloonTubeResult};
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::{
@@ -440,12 +440,15 @@ impl Balloon {
         base_features: u64,
         command_tube: Tube,
         inflate_tube: Option<Tube>,
+        init_balloon_size: u64,
     ) -> Result<Balloon> {
         Ok(Balloon {
             command_tube: Some(command_tube),
             inflate_tube,
             config: Arc::new(BalloonConfig {
-                num_pages: AtomicUsize::new(0),
+                num_pages: AtomicUsize::new(
+                    (init_balloon_size >> VIRTIO_BALLOON_PFN_SHIFT) as usize,
+                ),
                 actual_pages: AtomicUsize::new(0),
             }),
             kill_evt: None,

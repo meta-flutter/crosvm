@@ -19,14 +19,14 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use arch::{set_default_serial_parameters, Pstore, VcpuAffinity};
-use base::{debug, error, getpid, info, kill_process_group, reap_child, syslog, warn};
+use base::{debug, error, getpid, info, kill_process_group, pagesize, reap_child, syslog, warn};
 #[cfg(feature = "direct")]
 use crosvm::DirectIoOption;
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
-    platform, BindMount, Config, DiskOption, Executable, GidMap, SharedDir, TouchDeviceOption,
-    VfioCommand, VhostUserFsOption, VhostUserOption, VhostUserWlOption, VhostVsockDeviceParameter,
-    DISK_ID_LEN,
+    platform, BindMount, Config, DiskOption, Executable, FileBackedMappingParameters, GidMap,
+    SharedDir, TouchDeviceOption, VfioCommand, VhostUserFsOption, VhostUserOption,
+    VhostUserWlOption, VhostVsockDeviceParameter, DISK_ID_LEN,
 };
 use devices::serial_device::{SerialHardware, SerialParameters, SerialType};
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
@@ -1012,6 +1012,7 @@ fn parse_stub_pci_parameters(s: Option<&str>) -> argument::Result<StubPciParamet
                 params.subclass = (class >> 8) as u8;
                 params.programming_interface = class as u8;
             }
+            "multifunction" => {} // Ignore but allow the multifunction option for compatibility.
             "subsystem_vendor" => params.subsystem_vendor_id = opt.parse_numeric::<u16>()?,
             "subsystem_device" => params.subsystem_device_id = opt.parse_numeric::<u16>()?,
             "revision" => params.revision_id = opt.parse_numeric::<u8>()?,
@@ -1020,6 +1021,62 @@ fn parse_stub_pci_parameters(s: Option<&str>) -> argument::Result<StubPciParamet
     }
 
     Ok(params)
+}
+
+fn parse_file_backed_mapping(s: Option<&str>) -> argument::Result<FileBackedMappingParameters> {
+    let s = s.ok_or(argument::Error::ExpectedValue(String::from(
+        "file-backed-mapping: memory mapping option value required",
+    )))?;
+
+    let mut address = None;
+    let mut size = None;
+    let mut path = None;
+    let mut offset = None;
+    let mut writable = false;
+    let mut sync = false;
+    let mut align = false;
+    for opt in argument::parse_key_value_options("file-backed-mapping", s, ',') {
+        match opt.key() {
+            "addr" => address = Some(opt.parse_numeric::<u64>()?),
+            "size" => size = Some(opt.parse_numeric::<u64>()?),
+            "path" => path = Some(PathBuf::from(opt.value()?)),
+            "offset" => offset = Some(opt.parse_numeric::<u64>()?),
+            "ro" => writable = !opt.parse_or::<bool>(true)?,
+            "rw" => writable = opt.parse_or::<bool>(true)?,
+            "sync" => sync = opt.parse_or::<bool>(true)?,
+            "align" => align = opt.parse_or::<bool>(true)?,
+            _ => return Err(opt.invalid_key_err()),
+        }
+    }
+
+    let (address, path, size) = match (address, path, size) {
+        (Some(a), Some(p), Some(s)) => (a, p, s),
+        _ => {
+            return Err(argument::Error::ExpectedValue(String::from(
+                "file-backed-mapping: address, size, and path parameters are required",
+            )))
+        }
+    };
+
+    let pagesize_mask = pagesize() as u64 - 1;
+    let aligned_address = address & !pagesize_mask;
+    let aligned_size = ((address + size + pagesize_mask) & !pagesize_mask) - aligned_address;
+
+    if !align && (aligned_address != address || aligned_size != size) {
+        return Err(argument::Error::InvalidValue {
+            value: s.to_owned(),
+            expected: String::from("addr and size parameters must be page size aligned"),
+        });
+    }
+
+    Ok(FileBackedMappingParameters {
+        address: aligned_address,
+        size: aligned_size,
+        path,
+        offset: offset.unwrap_or(0),
+        writable,
+        sync,
+    })
 }
 
 fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::Result<()> {
@@ -1152,6 +1209,17 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "per-vm-core-scheduling" => {
             cfg.per_vm_core_scheduling = true;
+        }
+        "vcpu-cgroup-path" => {
+            let vcpu_cgroup_path = PathBuf::from(value.unwrap());
+            if !vcpu_cgroup_path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: value.unwrap().to_owned(),
+                    expected: String::from("This vcpu_cgroup_path path does not exist"),
+                });
+            }
+
+            cfg.vcpu_cgroup_path = Some(vcpu_cgroup_path);
         }
         #[cfg(feature = "audio_cras")]
         "cras-snd" => {
@@ -1606,6 +1674,21 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.socket_path = Some(socket_path);
         }
+        "balloon-control" => {
+            if cfg.balloon_control.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`balloon-control` already given".to_owned(),
+                ));
+            }
+            let path = PathBuf::from(value.unwrap());
+            if path.is_dir() || !path.exists() {
+                return Err(argument::Error::InvalidValue {
+                    value: path.to_string_lossy().into_owned(),
+                    expected: String::from("path is directory or missing"),
+                });
+            }
+            cfg.balloon_control = Some(path);
+        }
         "disable-sandbox" => {
             cfg.sandbox = false;
         }
@@ -1993,9 +2076,13 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         }
         "protected-vm" => {
             cfg.protected_vm = ProtectionType::Protected;
+            // Balloon device only works for unprotected VMs.
+            cfg.balloon = false;
         }
         "protected-vm-without-firmware" => {
             cfg.protected_vm = ProtectionType::ProtectedWithoutFirmware;
+            // Balloon device only works for unprotected VMs.
+            cfg.balloon = false;
         }
         "battery" => {
             let params = parse_battery_options(value)?;
@@ -2011,6 +2098,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                     expected: String::from("expected a valid port number"),
                 })?;
             cfg.gdb = Some(port);
+        }
+        "no-balloon" => {
+            cfg.balloon = false;
         }
         "balloon_bias_mib" => {
             cfg.balloon_bias =
@@ -2226,6 +2316,27 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
             cfg.coiommu_param = Some(params);
         }
+        "file-backed-mapping" => {
+            cfg.file_backed_mappings
+                .push(parse_file_backed_mapping(value)?);
+        }
+        "init-mem" => {
+            if cfg.init_memory.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`init-mem` already given".to_owned(),
+                ));
+            }
+            cfg.init_memory =
+                Some(
+                    value
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| argument::Error::InvalidValue {
+                            value: value.unwrap().to_owned(),
+                            expected: String::from("this value for `init-mem` needs to be integer"),
+                        })?,
+                )
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -2326,6 +2437,11 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
             }
         }
     }
+    if !cfg.balloon && cfg.balloon_control.is_some() {
+        return Err(argument::Error::ExpectedArgument(
+            "'balloon-control' requires enabled balloon".to_owned(),
+        ));
+    }
     set_default_serial_parameters(&mut cfg.serial_parameters);
     Ok(())
 }
@@ -2357,7 +2473,8 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
           Argument::flag("per-vm-core-scheduling", "Enable per-VM core scheduling intead of the default one (per-vCPU core scheduing) by
               making all vCPU threads share same cookie for core scheduling.
               This option is no-op on devices that have neither MDS nor L1TF vulnerability."),
-          #[cfg(feature = "audio_cras")]
+          Argument::value("vcpu-cgroup-path", "PATH", "Move all vCPU threads to this CGroup (default: nothing moves)."),
+#[cfg(feature = "audio_cras")]
           Argument::value("cras-snd",
           "[capture=true,client=crosvm,socket=unified,num_output_streams=1,num_input_streams=1]",
           "Comma separated key=value pairs for setting up cras snd devices.
@@ -2373,6 +2490,9 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                                 "mem",
                                 "N",
                                 "Amount of guest memory in MiB. (default: 256)"),
+          Argument::value("init-mem",
+                          "N",
+                          "Amount of guest memory outside the balloon at boot in MiB. (default: --mem)"),
           Argument::flag("hugepages", "Advise the kernel to use Huge Pages for guest memory mappings."),
           Argument::short_value('r',
                                 "root",
@@ -2437,6 +2557,7 @@ fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
                                 "socket",
                                 "PATH",
                                 "Path to put the control socket. If PATH is a directory, a name will be generated."),
+          Argument::value("balloon-control", "PATH", "Path for balloon controller socket."),
           Argument::flag("disable-sandbox", "Run all devices in one, non-sandboxed process."),
           Argument::value("cid", "CID", "Context ID for virtual sockets."),
           Argument::value("shared-dir", "PATH:TAG[:type=TYPE:writeback=BOOL:timeout=SECONDS:uidmap=UIDMAP:gidmap=GIDMAP:cache=CACHE:dax=BOOL,posix_acl=BOOL]",
@@ -2536,6 +2657,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               Possible key values:
                               type=goldfish - type of battery emulation, defaults to goldfish"),
           Argument::value("gdb", "PORT", "(EXPERIMENTAL) gdb on the given port"),
+          Argument::flag("no-balloon", "Don't use virtio-balloon device in the guest"),
           Argument::value("balloon_bias_mib", "N", "Amount to bias balance of memory between host and guest as the balloon inflates, in MiB."),
           Argument::value("vhost-user-blk", "SOCKET_PATH", "Path to a socket for vhost-user block"),
           Argument::value("vhost-user-console", "SOCKET_PATH", "Path to a socket for vhost-user console"),
@@ -2553,13 +2675,13 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("direct-pmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct port mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
           #[cfg(feature = "direct")]
           Argument::value("direct-mmio", "PATH@RANGE[,RANGE[,...]]", "Path and ranges for direct memory mapped I/O access. RANGE may be decimal or hex (starting with 0x)."),
-          #[cfg(feature = "direct")]
+#[cfg(feature = "direct")]
           Argument::value("direct-level-irq", "irq", "Enable interrupt passthrough"),
-          #[cfg(feature = "direct")]
+#[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
-          #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM"),
           Argument::value("stub-pci-device", "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]", "Comma-separated key=value pairs for setting up a stub PCI device that just enumerates. The first option in the list must specify a PCI address to claim.
                               Optional further parameters
@@ -2577,6 +2699,16 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                               unpin_interval=NUM - Unpin interval time in seconds.
                               unpin_limit=NUM - Unpin limit for each unpin cycle, in unit of page count. 0 is invalid.
                               unpin_gen_threshold=NUM -  Number of unpin intervals a pinned page must be busy for to be aged into the older which is less frequently checked generation."),
+          Argument::value("file-backed-mapping", "addr=NUM,size=SIZE,path=PATH[,offset=NUM][,ro][,rw][,sync]", "Map the given file into guest memory at the specified address.
+                              Parameters (addr, size, path are required):
+                              addr=NUM - guest physical address to map at
+                              size=NUM - amount of memory to map
+                              path=PATH - path to backing file/device to map
+                              offset=NUM - offset in backing file (default 0)
+                              ro - make the mapping readonly (default)
+                              rw - make the mapping writable
+                              sync - open backing file with O_SYNC
+                              align - whether to adjust addr and size to page boundaries implicitly"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2594,7 +2726,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
                     Ok(CommandStatus::VmStop)
                 }
                 Err(e) => {
-                    error!("{}", e);
+                    error!("{:#}", e);
                     Err(())
                 }
             }
@@ -3965,5 +4097,59 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid base range value"));
+    }
+
+    #[test]
+    fn parse_file_backed_mapping_valid() {
+        let params = parse_file_backed_mapping(Some(
+            "addr=0x1000,size=0x2000,path=/dev/mem,offset=0x3000,ro,rw,sync",
+        ))
+        .unwrap();
+        assert_eq!(params.address, 0x1000);
+        assert_eq!(params.size, 0x2000);
+        assert_eq!(params.path, PathBuf::from("/dev/mem"));
+        assert_eq!(params.offset, 0x3000);
+        assert!(params.writable);
+        assert!(params.sync);
+    }
+
+    #[test]
+    fn parse_file_backed_mapping_incomplete() {
+        assert!(parse_file_backed_mapping(Some("addr=0x1000,size=0x2000"))
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(parse_file_backed_mapping(Some("size=0x2000,path=/dev/mem"))
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(parse_file_backed_mapping(Some("addr=0x1000,path=/dev/mem"))
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+    }
+
+    #[test]
+    fn parse_file_backed_mapping_unaligned() {
+        assert!(
+            parse_file_backed_mapping(Some("addr=0x1001,size=0x2000,path=/dev/mem"))
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+        assert!(
+            parse_file_backed_mapping(Some("addr=0x1000,size=0x2001,path=/dev/mem"))
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+    }
+
+    #[test]
+    fn parse_file_backed_mapping_align() {
+        let params =
+            parse_file_backed_mapping(Some("addr=0x3042,size=0xff0,path=/dev/mem,align")).unwrap();
+        assert_eq!(params.address, 0x3000);
+        assert_eq!(params.size, 0x2000);
     }
 }

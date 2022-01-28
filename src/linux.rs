@@ -4,10 +4,11 @@
 
 use std::cmp::{max, Reverse};
 use std::collections::{BTreeMap, HashSet};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 #[cfg(feature = "gpu")]
 use std::env;
 use std::fs::{File, OpenOptions};
+use std::io::prelude::*;
 use std::io::stdin;
 use std::iter;
 use std::mem;
@@ -19,10 +20,11 @@ use std::str;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
+use std::process;
 use std::thread;
 use std::thread::JoinHandle;
 
-use libc::{self, c_int, gid_t, uid_t};
+use libc::{self, c_int, c_ulong, gid_t, uid_t};
 
 use acpi_tables::sdt::SDT;
 
@@ -122,6 +124,7 @@ struct SandboxConfig<'a> {
     seccomp_policy: &'a Path,
     uid_map: Option<&'a str>,
     gid_map: Option<&'a str>,
+    remount_mode: Option<c_ulong>,
 }
 
 fn create_base_minijail(
@@ -181,6 +184,10 @@ fn create_base_minijail(
         j.use_seccomp_filter();
         // Don't do init setup.
         j.run_as_init();
+        // Set up requested remount mode instead of default MS_PRIVATE.
+        if let Some(mode) = config.remount_mode {
+            j.set_remount_mode(mode);
+        }
     }
 
     // Only pivot_root if we are not re-using the current root directory.
@@ -214,6 +221,7 @@ fn simple_jail(cfg: &Config, policy: &str) -> Result<Option<Minijail>> {
             seccomp_policy: &policy_path,
             uid_map: None,
             gid_map: None,
+            remount_mode: None,
         };
         Ok(Some(create_base_minijail(root_path, None, Some(&config))?))
     } else {
@@ -398,7 +406,6 @@ fn create_cras_snd_device(cfg: &Config, cras_snd: CrasSndParameters) -> DeviceRe
 fn create_tpm_device(cfg: &Config) -> DeviceResult {
     use std::ffi::CString;
     use std::fs;
-    use std::process;
 
     let tpm_storage: PathBuf;
     let mut tpm_jail = simple_jail(cfg, "tpm_device")?;
@@ -595,9 +602,19 @@ fn create_vinput_device(cfg: &Config, dev_path: &Path) -> DeviceResult {
     })
 }
 
-fn create_balloon_device(cfg: &Config, tube: Tube, inflate_tube: Option<Tube>) -> DeviceResult {
-    let dev = virtio::Balloon::new(virtio::base_features(cfg.protected_vm), tube, inflate_tube)
-        .context("failed to create balloon")?;
+fn create_balloon_device(
+    cfg: &Config,
+    tube: Tube,
+    inflate_tube: Option<Tube>,
+    init_balloon_size: u64,
+) -> DeviceResult {
+    let dev = virtio::Balloon::new(
+        virtio::base_features(cfg.protected_vm),
+        tube,
+        inflate_tube,
+        init_balloon_size,
+    )
+    .context("failed to create balloon")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
@@ -987,10 +1004,20 @@ fn get_gpu_render_server_environment(cache_info: &GpuCacheInfo) -> Result<Vec<St
 }
 
 #[cfg(feature = "gpu")]
+struct ScopedMinijail(Minijail);
+
+#[cfg(feature = "gpu")]
+impl Drop for ScopedMinijail {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+#[cfg(feature = "gpu")]
 fn start_gpu_render_server(
     cfg: &Config,
     render_server_parameters: &GpuRenderServerParameters,
-) -> Result<SafeDescriptor> {
+) -> Result<(Minijail, SafeDescriptor)> {
     let (server_socket, client_socket) =
         UnixSeqpacket::pair().context("failed to create render server socket")?;
 
@@ -1052,7 +1079,7 @@ fn start_gpu_render_server(
     )?)
     .context("failed to start gpu render server")?;
 
-    Ok(SafeDescriptor::from(client_socket))
+    Ok((jail, SafeDescriptor::from(client_socket)))
 }
 
 fn create_wayland_device(
@@ -1247,13 +1274,11 @@ fn create_fs_device(
             gid_map: Some(gid_map),
             log_failures: cfg.seccomp_log_failures,
             seccomp_policy: &seccomp_policy,
+            // We want bind mounts from the parent namespaces to propagate into the fs device's
+            // namespace.
+            remount_mode: Some(libc::MS_SLAVE),
         };
-        let mut jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
-        // We want bind mounts from the parent namespaces to propagate into the fs device's
-        // namespace.
-        jail.set_remount_mode(libc::MS_SLAVE);
-
-        jail
+        create_base_minijail(src, Some(max_open_files), Some(&config))?
     } else {
         create_base_minijail(src, Some(max_open_files), None)?
     };
@@ -1288,12 +1313,12 @@ fn create_9p_device(
             gid_map: Some(gid_map),
             log_failures: cfg.seccomp_log_failures,
             seccomp_policy: &seccomp_policy,
+            // We want bind mounts from the parent namespaces to propagate into the 9p server's
+            // namespace.
+            remount_mode: Some(libc::MS_SLAVE),
         };
 
-        let mut jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
-        // We want bind mounts from the parent namespaces to propagate into the 9p server's
-        // namespace.
-        jail.set_remount_mode(libc::MS_SLAVE);
+        let jail = create_base_minijail(src, Some(max_open_files), Some(&config))?;
 
         //  The shared directory becomes the root of the device's file system.
         let root = Path::new("/");
@@ -1493,12 +1518,14 @@ fn create_virtio_devices(
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
     vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
-    balloon_device_tube: Tube,
+    balloon_device_tube: Option<Tube>,
     balloon_inflate_tube: Option<Tube>,
+    init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     fs_device_tubes: &mut Vec<Tube>,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -1581,11 +1608,14 @@ fn create_virtio_devices(
         devs.push(create_vinput_device(cfg, dev_path)?);
     }
 
-    devs.push(create_balloon_device(
-        cfg,
-        balloon_device_tube,
-        balloon_inflate_tube,
-    )?);
+    if let Some(balloon_device_tube) = balloon_device_tube {
+        devs.push(create_balloon_device(
+            cfg,
+            balloon_device_tube,
+            balloon_inflate_tube,
+            init_balloon_size,
+        )?);
+    }
 
     // We checked above that if the IP is defined, then the netmask is, too.
     for tap_fd in &cfg.tap_fd {
@@ -1729,11 +1759,6 @@ fn create_virtio_devices(
                     jail: simple_jail(cfg, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
-            }
-
-            let mut render_server_fd = None;
-            if let Some(ref render_server_parameters) = gpu_parameters.render_server {
-                render_server_fd = Some(start_gpu_render_server(cfg, render_server_parameters)?);
             }
 
             devs.push(create_gpu_device(
@@ -1948,12 +1973,14 @@ fn create_devices(
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
     vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
-    balloon_device_tube: Tube,
+    balloon_device_tube: Option<Tube>,
+    init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
     pmem_device_tubes: &mut Vec<Tube>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
+    #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
@@ -2077,10 +2104,13 @@ fn create_devices(
         vhost_user_gpu_tubes,
         balloon_device_tube,
         balloon_inflate_tube,
+        init_balloon_size,
         disk_device_tubes,
         pmem_device_tubes,
         map_request,
         fs_device_tubes,
+        #[cfg(feature = "gpu")]
+        render_server_fd,
     )?;
 
     for stub in stubs {
@@ -2113,6 +2143,56 @@ fn create_devices(
     }
 
     Ok(devices)
+}
+
+fn create_file_backed_mappings(
+    cfg: &Config,
+    vm: &mut impl Vm,
+    resources: &mut SystemAllocator,
+) -> Result<()> {
+    for mapping in &cfg.file_backed_mappings {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(mapping.writable)
+            .custom_flags(if mapping.sync { libc::O_SYNC } else { 0 })
+            .open(&mapping.path)
+            .context("failed to open file for file-backed mapping")?;
+        let prot = if mapping.writable {
+            Protection::read_write()
+        } else {
+            Protection::read()
+        };
+        let size = mapping
+            .size
+            .try_into()
+            .context("Invalid size for file-backed mapping")?;
+        let memory_mapping = MemoryMappingBuilder::new(size)
+            .from_file(&file)
+            .offset(mapping.offset)
+            .protection(prot)
+            .build()
+            .context("failed to map backing file for file-backed mapping")?;
+
+        resources
+            .mmio_allocator_any()
+            .allocate_at(
+                mapping.address,
+                mapping.size,
+                Alloc::FileBacked(mapping.address),
+                "file-backed mapping".to_owned(),
+            )
+            .context("failed to allocate guest address for file-backed mapping")?;
+
+        vm.add_memory_region(
+            GuestAddress(mapping.address),
+            Box::new(memory_mapping),
+            !mapping.writable,
+            /* log_dirty_pages = */ false,
+        )
+        .context("failed to configure file-backed mapping")?;
+    }
+
+    Ok(())
 }
 
 #[derive(Copy, Clone)]
@@ -2221,6 +2301,7 @@ fn runnable_vcpu<V>(
     use_hypervisor_signals: bool,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
+    vcpu_cgroup_tasks_file: Option<File>,
 ) -> Result<(V, VcpuRunHandle)>
 where
     V: VcpuArch,
@@ -2269,6 +2350,12 @@ where
         if let Err(e) = enable_core_scheduling() {
             error!("Failed to enable core scheduling: {}", e);
         }
+    }
+
+    // Move vcpu thread to cgroup
+    if let Some(mut f) = vcpu_cgroup_tasks_file {
+        f.write_all(base::gettid().to_string().as_bytes())
+            .context("failed to write vcpu tid to cgroup tasks")?;
     }
 
     if run_rt {
@@ -2397,6 +2484,7 @@ fn run_vcpu<V>(
     >,
     enable_per_vm_core_scheduling: bool,
     host_cpu_topology: bool,
+    vcpu_cgroup_tasks_file: Option<File>,
 ) -> Result<JoinHandle<()>>
 where
     V: VcpuArch + 'static,
@@ -2424,6 +2512,7 @@ where
                 use_hypervisor_signals,
                 enable_per_vm_core_scheduling,
                 host_cpu_topology,
+                vcpu_cgroup_tasks_file,
             );
 
             start_barrier.wait();
@@ -2880,12 +2969,28 @@ where
 
     let (wayland_host_tube, wayland_device_tube) = Tube::pair().context("failed to create tube")?;
     control_tubes.push(TaggedControlTube::VmMemory(wayland_host_tube));
-    // Balloon gets a special socket so balloon requests can be forwarded from the main process.
-    let (balloon_host_tube, balloon_device_tube) = Tube::pair().context("failed to create tube")?;
-    // Set recv timeout to avoid deadlock on sending BalloonControlCommand before guest is ready.
-    balloon_host_tube
-        .set_recv_timeout(Some(Duration::from_millis(100)))
-        .context("failed to create tube")?;
+
+    let (balloon_host_tube, balloon_device_tube) = if cfg.balloon {
+        if let Some(ref path) = cfg.balloon_control {
+            (
+                None,
+                Some(Tube::new(
+                    UnixSeqpacket::connect(path).context("failed to create balloon control")?,
+                )),
+            )
+        } else {
+            // Balloon gets a special socket so balloon requests can be forwarded
+            // from the main process.
+            let (host, device) = Tube::pair().context("failed to create tube")?;
+            // Set recv timeout to avoid deadlock on sending BalloonControlCommand
+            // before the guest is ready.
+            host.set_recv_timeout(Some(Duration::from_millis(100)))
+                .context("failed to set timeout")?;
+            (Some(host), Some(device))
+        }
+    } else {
+        (None, None)
+    };
 
     // Create one control socket per disk.
     let mut disk_device_tubes = Vec::new();
@@ -2970,7 +3075,31 @@ where
         None => None,
     };
 
+    create_file_backed_mappings(&cfg, &mut vm, &mut sys_allocator)?;
+
     let phys_max_addr = (1u64 << vm.get_guest_phys_addr_bits()) - 1;
+
+    #[cfg(feature = "gpu")]
+    // Hold on to the render server jail so it keeps running until we exit run_vm()
+    let mut _render_server_jail = None;
+    #[cfg(feature = "gpu")]
+    let mut render_server_fd = None;
+    #[cfg(feature = "gpu")]
+    if let Some(gpu_parameters) = &cfg.gpu_parameters {
+        if let Some(ref render_server_parameters) = gpu_parameters.render_server {
+            let (jail, fd) = start_gpu_render_server(&cfg, render_server_parameters)?;
+            _render_server_jail = Some(ScopedMinijail(jail));
+            render_server_fd = Some(fd);
+        }
+    }
+
+    let init_balloon_size = components
+        .memory_size
+        .checked_sub(cfg.init_memory.map_or(components.memory_size, |m| {
+            m.checked_mul(1024 * 1024).unwrap_or(u64::MAX)
+        }))
+        .context("failed to calculate init balloon size")?;
+
     let mut devices = create_devices(
         &cfg,
         &mut vm,
@@ -2982,12 +3111,15 @@ where
         gpu_device_tube,
         vhost_user_gpu_tubes,
         balloon_device_tube,
+        init_balloon_size,
         &mut disk_device_tubes,
         &mut pmem_device_tubes,
         &mut fs_device_tubes,
         #[cfg(feature = "usb")]
         usb_provider,
         Arc::clone(&map_request),
+        #[cfg(feature = "gpu")]
+        render_server_fd,
     )?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -3265,7 +3397,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     cfg: Config,
     control_server_socket: Option<UnlinkUnixSeqpacketListener>,
     mut control_tubes: Vec<TaggedControlTube>,
-    balloon_host_tube: Tube,
+    balloon_host_tube: Option<Tube>,
     disk_host_tubes: &[Tube],
     #[cfg(feature = "usb")] usb_control_tube: Tube,
     exit_evt: Event,
@@ -3355,6 +3487,15 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             error!("Failed to enable core scheduling: {}", e);
         }
     }
+    let vcpu_cgroup_tasks_file = match &cfg.vcpu_cgroup_path {
+        None => None,
+        Some(cgroup_path) => {
+            // Move main process to cgroup_path
+            let mut f = File::create(&cgroup_path.join("tasks"))?;
+            f.write_all(process::id().to_string().as_bytes())?;
+            Some(f)
+        }
+    };
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {
@@ -3388,6 +3529,13 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             to_gdb_channel.clone(),
             cfg.per_vm_core_scheduling,
             cfg.host_cpu_topology,
+            match vcpu_cgroup_tasks_file {
+                None => None,
+                Some(ref f) => Some(
+                    f.try_clone()
+                        .context("failed to clone vcpu cgroup tasks file")?,
+                ),
+            },
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -3511,7 +3659,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         }
                                         _ => request.execute(
                                             &mut run_mode_opt,
-                                            &balloon_host_tube,
+                                            balloon_host_tube.as_ref(),
                                             &mut balloon_stats_id,
                                             disk_host_tubes,
                                             #[cfg(feature = "usb")]

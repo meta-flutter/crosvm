@@ -79,6 +79,8 @@ mod vcpu;
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "gpu")]
+pub use gpu::GpuRenderServerParameters;
+#[cfg(feature = "gpu")]
 use gpu::*;
 
 // gpu_device_tube is not used when GPU support is disabled.
@@ -99,6 +101,7 @@ fn create_virtio_devices(
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
+    vvu_proxy_device_tubes: &mut Vec<Tube>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -236,7 +239,11 @@ fn create_virtio_devices(
     }
 
     for opt in &cfg.vvu_proxy {
-        devs.push(create_vvu_proxy_device(cfg, opt)?);
+        devs.push(create_vvu_proxy_device(
+            cfg,
+            opt,
+            vvu_proxy_device_tubes.remove(0),
+        )?);
     }
 
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
@@ -449,6 +456,7 @@ fn create_devices(
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
+    vvu_proxy_device_tubes: &mut Vec<Tube>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
@@ -579,6 +587,7 @@ fn create_devices(
         fs_device_tubes,
         #[cfg(feature = "gpu")]
         render_server_fd,
+        vvu_proxy_device_tubes,
     )?;
 
     for stub in stubs {
@@ -978,6 +987,14 @@ where
         fs_device_tubes.push(fs_device_tube);
     }
 
+    let mut vvu_proxy_device_tubes = Vec::new();
+    for _ in 0..cfg.vvu_proxy.len() {
+        let (vvu_proxy_host_tube, vvu_proxy_device_tube) =
+            Tube::pair().context("failed to create VVU proxy tube")?;
+        control_tubes.push(TaggedControlTube::VmMemory(vvu_proxy_host_tube));
+        vvu_proxy_device_tubes.push(vvu_proxy_device_tube);
+    }
+
     let exit_evt = Event::new().context("failed to create event")?;
     let reset_evt = Event::new().context("failed to create event")?;
     let crash_evt = Event::new().context("failed to create event")?;
@@ -998,17 +1015,13 @@ where
 
     #[cfg(feature = "gpu")]
     // Hold on to the render server jail so it keeps running until we exit run_vm()
-    let mut _render_server_jail = None;
-    #[cfg(feature = "gpu")]
-    let mut render_server_fd = None;
-    #[cfg(feature = "gpu")]
-    if let Some(gpu_parameters) = &cfg.gpu_parameters {
-        if let Some(ref render_server_parameters) = gpu_parameters.render_server {
-            let (jail, fd) = start_gpu_render_server(&cfg, render_server_parameters)?;
-            _render_server_jail = Some(ScopedMinijail(jail));
-            render_server_fd = Some(fd);
-        }
-    }
+    let (_render_server_jail, render_server_fd) =
+        if let Some(parameters) = &cfg.gpu_render_server_parameters {
+            let (jail, fd) = start_gpu_render_server(&cfg, parameters)?;
+            (Some(ScopedMinijail(jail)), Some(fd))
+        } else {
+            (None, None)
+        };
 
     let init_balloon_size = components
         .memory_size
@@ -1037,6 +1050,7 @@ where
         Arc::clone(&map_request),
         #[cfg(feature = "gpu")]
         render_server_fd,
+        &mut vvu_proxy_device_tubes,
     )?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

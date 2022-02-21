@@ -4,9 +4,6 @@
 
 //! Implement a userspace PCI device driver for the virtio vhost-user device.
 
-// TODO(keiichiw): Remove once block driver is landed.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -166,6 +163,18 @@ impl VvuPciCaps {
         }
 
         Ok(caps)
+    }
+
+    pub fn doorbell_off_multiplier(&self) -> u32 {
+        self.doorbell_off_multiplier
+    }
+
+    pub fn doorbell_base_addr(&self) -> &VfioRegionAddr {
+        &self.doorbell_base_addr
+    }
+
+    pub fn shared_mem_cfg_addr(&self) -> &VfioRegionAddr {
+        &self.shared_mem_cfg_addr
     }
 }
 

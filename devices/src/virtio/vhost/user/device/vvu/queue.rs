@@ -5,15 +5,11 @@
 //! Implement the driver side of virtio queue handling.
 //! The virtqueue struct is expected to be used in userspace VFIO virtio drivers.
 
-// TODO(keiichiw): Remove once block driver is landed.
-#![allow(dead_code)]
-
-use std::collections::BTreeMap;
-#[cfg(not(test))]
-use std::fs::File;
 use std::mem;
 use std::num::Wrapping;
 use std::sync::atomic::{fence, Ordering};
+#[cfg(not(test))]
+use std::{collections::BTreeMap, fs::File};
 
 use anyhow::{anyhow, bail, Context, Result};
 use data_model::{DataInit, Le16, Le32, Le64, VolatileSlice};
@@ -120,6 +116,7 @@ pub struct UserQueue {
     /// are assuming that memory mapping is fixed during the vvu negotiation.
     /// Once virtio-iommu supports VFIO usage, we can remove this workaround and we should use
     /// VFIO_IOMMU_MAP_DMA call to get physical addresses.
+    #[cfg(not(test))]
     addr_table: BTreeMap<GuestAddress, u64>,
 }
 
@@ -135,6 +132,7 @@ impl UserQueue {
             used_count: Wrapping(0),
             free_count: Wrapping(size),
             device_writable,
+            #[cfg(not(test))]
             addr_table: Default::default(),
         };
 
@@ -578,13 +576,15 @@ mod test {
         drv_to_dev(queue_size, iteration);
     }
 
+    // This test loops (65536 + 20) times. To avoid running it on slow emulated CI environments,
+    // specify target architecture.
+    // TODO(keiichiw): Change the test to mutate queues' internal state to avoid the actual loop.
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn test_driver_write_wrapping() {
         // Test the index can be wrapped around when the iteration count exceeds 16bits.
         let queue_size = 256;
 
-        // TODO(keiichiw): Looping (65536 + 20) times takes a long time especially on QEMU for CI.
-        // It's nice if we can modify queues' internal state to avoid the actual looping.
         let iteration = u32::from(u16::MAX) + 20;
         drv_to_dev(queue_size, iteration);
     }
@@ -623,12 +623,14 @@ mod test {
         dev_to_drv(queue_size, iteration);
     }
 
+    // This test loops (65536 + 20) times. To avoid running it on slow emulated CI environments,
+    // specify target architecture.
+    // TODO(keiichiw): Change the test to mutate queues' internal state to avoid the actual loop.
     #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn test_driver_read_wrapping() {
         // Test the index can be wrapped around when the iteration count exceeds 16bits.
         let queue_size = 256;
-        // TODO(keichiw): Looping (65536 + 20) times takes a long time especially on QEMU for CI.
-        // It's nice if we can modify queues' internal state to avoid the actual looping.
         let iteration = u32::from(u16::MAX) + 20;
         dev_to_drv(queue_size, iteration);
     }

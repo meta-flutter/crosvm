@@ -35,16 +35,19 @@ use vmm_vhost::{
     Protocol, SlaveReqHelper,
 };
 
-use crate::pci::{
-    PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType, PciCapability,
-    PciCapabilityID,
-};
 use crate::virtio::descriptor_utils::Error as DescriptorUtilsError;
 use crate::virtio::{
     copy_config, DescriptorChain, Interrupt, PciCapabilityType, Queue, Reader, SignalableInterrupt,
     VirtioDevice, VirtioPciCap, Writer, TYPE_VHOST_USER,
 };
 use crate::PciAddress;
+use crate::{
+    pci::{
+        PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType, PciCapability,
+        PciCapabilityID,
+    },
+    virtio::VIRTIO_MSI_NO_VECTOR,
+};
 
 use remain::sorted;
 use thiserror::Error as ThisError;
@@ -163,6 +166,9 @@ pub enum Error {
     /// Failed to send a memory mapping request.
     #[error("memory mapping request failed")]
     MemoryMappingRequestFailure,
+    /// MSI vector not set for a vring.
+    #[error("MSI vector not set for {}-th vring: {0}")]
+    MsiVectorNotSet(usize),
     /// Failed to parse vring kick / call file descriptors.
     #[error("failed to parse vring kick / call file descriptors: {0}")]
     ParseVringFdRequest(VhostError),
@@ -289,7 +295,7 @@ struct KickData {
     kick_evt: Option<Event>,
 
     // The interrupt to be injected to the guest in response to an event to |kick_evt|.
-    msi_vector: u16,
+    msi_vector: Option<u16>,
 }
 
 // Vring related data sent through |SET_VRING_KICK| and |SET_VRING_CALL|.
@@ -855,8 +861,13 @@ impl Worker {
         kick_evt
             .read()
             .map_err(|e| Error::FailedToReadKickEvt(e, index))?;
-        self.interrupt.signal_used_queue(kick_data.msi_vector);
-        Ok(())
+        match kick_data.msi_vector {
+            Some(msi_vector) => {
+                self.interrupt.signal_used_queue(msi_vector);
+                Ok(())
+            }
+            None => Err(Error::MsiVectorNotSet(index)),
+        }
     }
 
     // Processes a message sent, on `main_thread_tube`, in response to a doorbell write. It writes
@@ -1000,9 +1011,10 @@ impl VirtioVhostUser {
     fn write_bar_doorbell(&mut self, offset: u64) {
         // The |offset| represents the Vring number who call event needs to be
         // written to.
+        let vring = (offset / DOORBELL_OFFSET_MULTIPLIER as u64) as usize;
         match &self.worker_thread_tube {
             Some(worker_thread_tube) => {
-                if let Err(e) = worker_thread_tube.send(&offset) {
+                if let Err(e) = worker_thread_tube.send(&vring) {
                     error!("failed to send doorbell write request: {}", e);
                 }
             }
@@ -1036,7 +1048,12 @@ impl VirtioVhostUser {
                         error!("invalid notification select: {}", notification_select);
                         return;
                     }
-                    self.notification_msix_vectors[notification_select as usize] = Some(val);
+                    self.notification_msix_vectors[notification_select as usize] =
+                        if val == VIRTIO_MSI_NO_VECTOR {
+                            None
+                        } else {
+                            Some(val)
+                        };
                 } else {
                     error!("no notification select set");
                 }
@@ -1117,13 +1134,7 @@ impl VirtioVhostUser {
         for (i, vring) in vrings.iter_mut().enumerate() {
             vring.kick_data = KickData {
                 kick_evt: None,
-                msi_vector: match self.notification_msix_vectors[i] {
-                    Some(msi_vector) => msi_vector,
-                    None => {
-                        error!("no vector set for ring {}", i);
-                        return;
-                    }
-                },
+                msi_vector: self.notification_msix_vectors[i],
             };
         }
 

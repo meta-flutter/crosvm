@@ -14,6 +14,7 @@ mod ac97_mixer;
 mod ac97_regs;
 mod coiommu;
 mod msix;
+mod pci_address;
 mod pci_configuration;
 mod pci_device;
 mod pci_root;
@@ -25,15 +26,15 @@ mod vfio_pci;
 pub use self::ac97::{Ac97Backend, Ac97Dev, Ac97Parameters};
 pub use self::coiommu::{CoIommuDev, CoIommuParameters, CoIommuUnpinPolicy};
 pub use self::msix::{MsixCap, MsixConfig, MsixStatus};
+pub use self::pci_address::PciAddress;
 pub use self::pci_configuration::{
     PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType, PciCapability,
     PciCapabilityID, PciClassCode, PciConfiguration, PciDisplaySubclass, PciHeaderType,
     PciProgrammingInterface, PciSerialBusSubClass, PciSubclass, CAPABILITY_LIST_HEAD_OFFSET,
 };
-pub use self::pci_device::Error as PciDeviceError;
-pub use self::pci_device::PciDevice;
-pub use self::pci_root::{PciAddress, PciConfigIo, PciConfigMmio, PciRoot};
-pub use self::pcie::{PciBridge, PcieRootPort};
+pub use self::pci_device::{BarRange, Error as PciDeviceError, PciDevice};
+pub use self::pci_root::{PciConfigIo, PciConfigMmio, PciRoot};
+pub use self::pcie::{PciBridge, PcieHostRootPort, PcieRootPort};
 pub use self::stub::{StubPciDevice, StubPciParameters};
 pub use self::vfio_pci::VfioPciDevice;
 

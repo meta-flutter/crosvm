@@ -2260,6 +2260,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "host-cpu-topology" => {
             cfg.host_cpu_topology = true;
         }
+        "privileged-vm" => {
+            cfg.privileged_vm = true;
+        }
         "stub-pci-device" => {
             cfg.stub_pci_devices.push(parse_stub_pci_parameters(value)?);
         }
@@ -2388,6 +2391,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "s2idle" => {
             cfg.force_s2idle = true;
         }
+        "strict-balloon" => {
+            cfg.strict_balloon = true;
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -2502,6 +2508,7 @@ enum CommandStatus {
     VmReset,
     VmStop,
     VmCrash,
+    GuestPanic,
 }
 
 fn run_vm(args: std::env::Args) -> std::result::Result<CommandStatus, ()> {
@@ -2740,6 +2747,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM"),
+          Argument::flag("privileged-vm", "Grant this Guest VM certian privileges to manage Host resources, such as power management."),
           Argument::value("stub-pci-device", "DOMAIN:BUS:DEVICE.FUNCTION[,vendor=NUM][,device=NUM][,class=NUM][,subsystem_vendor=NUM][,subsystem_device=NUM][,revision=NUM]", "Comma-separated key=value pairs for setting up a stub PCI device that just enumerates. The first option in the list must specify a PCI address to claim.
                               Optional further parameters
                               vendor=NUM - PCI vendor ID
@@ -2771,6 +2779,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("pivot-root", "PATH", "Path to empty directory to use for sandbox pivot root."),
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("s2idle", "Set Low Power S0 Idle Capable Flag for guest Fixed ACPI Description Table"),
+          Argument::flag("strict-balloon", "Don't allow guest to use pages from the balloon"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -2805,6 +2814,10 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
             Ok(platform::ExitState::Crash) => {
                 info!("crosvm has exited due to a VM crash");
                 Ok(CommandStatus::VmCrash)
+            }
+            Ok(platform::ExitState::GuestPanic) => {
+                info!("crosvm has exited due to a kernel panic in guest");
+                Ok(CommandStatus::GuestPanic)
             }
             Err(e) => {
                 error!("crosvm has exited with error: {:#}", e);
@@ -3462,6 +3475,7 @@ fn main() {
         Ok(CommandStatus::Success | CommandStatus::VmStop) => 0,
         Ok(CommandStatus::VmReset) => 32,
         Ok(CommandStatus::VmCrash) => 33,
+        Ok(CommandStatus::GuestPanic) => 34,
         Err(_) => 1,
     };
     std::process::exit(exit_code);

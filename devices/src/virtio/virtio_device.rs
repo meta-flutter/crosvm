@@ -42,6 +42,7 @@ pub trait VirtioDevice: Send {
     }
 
     /// The set of feature bits that this device supports in addition to the base features.
+    /// If this returns VIRTIO_F_ACCESS_PLATFORM, virtio-iommu will be enabled for this device.
     fn features(&self) -> u64 {
         0
     }

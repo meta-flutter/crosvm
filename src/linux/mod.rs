@@ -30,14 +30,15 @@ use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListene
 use base::*;
 use devices::serial_device::SerialHardware;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
+use devices::virtio::memory_mapper::MemoryMapperTrait;
 #[cfg(feature = "gpu")]
 use devices::virtio::{self, EventDevice};
 #[cfg(feature = "audio")]
 use devices::Ac97Dev;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqEventIndex, KvmKernelIrqChip, PciAddress,
-    PciBridge, PciDevice, PcieHostRootPort, PcieRootPort, StubPciDevice, VfioContainer,
-    VirtioPciDevice,
+    PciBridge, PciDevice, PcieHostRootPort, PcieRootPort, PvPanicCode, PvPanicPciDevice,
+    StubPciDevice, VirtioPciDevice,
 };
 use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
@@ -446,6 +447,7 @@ fn create_devices(
     vm: &mut impl Vm,
     resources: &mut SystemAllocator,
     exit_evt: &Event,
+    panic_wrtube: Tube,
     phys_max_addr: u64,
     control_tubes: &mut Vec<TaggedControlTube>,
     wayland_device_tube: Tube,
@@ -463,9 +465,9 @@ fn create_devices(
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
+    let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> =
+        BTreeMap::new();
     if !cfg.vfio.is_empty() {
-        let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
-            BTreeMap::new();
         let mut coiommu_attached_endpoints = Vec::new();
 
         for vfio_dev in cfg
@@ -530,21 +532,6 @@ fn create_devices(
             } else {
                 bail!("Get rlimit failed");
             }
-        }
-
-        if !iommu_attached_endpoints.is_empty() {
-            let iommu_dev = create_iommu_device(cfg, phys_max_addr, iommu_attached_endpoints)?;
-
-            let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
-            control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-            let mut dev =
-                VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-                    .context("failed to create virtio pci dev")?;
-            // early reservation for viommu.
-            dev.allocate_address(resources)
-                .context("failed to allocate resources early for virtio pci dev")?;
-            let dev = Box::new(dev);
-            devices.push((dev, iommu_dev.jail));
         }
 
         if !coiommu_attached_endpoints.is_empty() {
@@ -620,6 +607,31 @@ fn create_devices(
     for params in &cfg.stub_pci_devices {
         // Stub devices don't need jailing since they don't do anything.
         devices.push((Box::new(StubPciDevice::new(params)), None));
+    }
+
+    devices.push((Box::new(PvPanicPciDevice::new(panic_wrtube)), None));
+
+    let (translate_response_senders, request_rx) =
+        setup_virtio_access_platform(resources, &mut iommu_attached_endpoints, &mut devices)?;
+
+    if !iommu_attached_endpoints.is_empty() {
+        let iommu_dev = create_iommu_device(
+            cfg,
+            phys_max_addr,
+            iommu_attached_endpoints,
+            translate_response_senders,
+            request_rx,
+        )?;
+
+        let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+        control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
+        let mut dev = VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
+            .context("failed to create virtio pci dev")?;
+        // early reservation for viommu.
+        dev.allocate_address(resources)
+            .context("failed to allocate resources early for virtio pci dev")?;
+        let dev = Box::new(dev);
+        devices.push((dev, iommu_dev.jail));
     }
 
     Ok(devices)
@@ -850,6 +862,7 @@ pub enum ExitState {
     Reset,
     Stop,
     Crash,
+    GuestPanic,
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
@@ -1083,6 +1096,7 @@ where
     let exit_evt = Event::new().context("failed to create event")?;
     let reset_evt = Event::new().context("failed to create event")?;
     let crash_evt = Event::new().context("failed to create event")?;
+    let (panic_rdtube, panic_wrtube) = Tube::pair().context("failed to create tube")?;
     let mut sys_allocator = Arch::create_system_allocator(&vm);
 
     // Allocate the ramoops region first. AArch64::build_vm() assumes this.
@@ -1120,6 +1134,7 @@ where
         &mut vm,
         &mut sys_allocator,
         &exit_evt,
+        panic_wrtube,
         phys_max_addr,
         &mut control_tubes,
         wayland_device_tube,
@@ -1280,6 +1295,7 @@ where
         exit_evt,
         reset_evt,
         crash_evt,
+        panic_rdtube,
         sigchld_fd,
         Arc::clone(&map_request),
         gralloc,
@@ -1316,7 +1332,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
 
     let (hp_bus, bus_num) = get_hp_bus(linux, host_addr)?;
 
-    let mut endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> = BTreeMap::new();
+    let mut endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>> = BTreeMap::new();
     let (vfio_pci_device, jail) = create_vfio_device(
         cfg,
         &linux.vm,
@@ -1407,6 +1423,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     exit_evt: Event,
     reset_evt: Event,
     crash_evt: Event,
+    panic_rdtube: Tube,
     sigchld_fd: SignalFd,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
@@ -1417,6 +1434,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         Exit,
         Reset,
         Crash,
+        Panic,
         Suspend,
         ChildSignal,
         IrqFd { index: IrqEventIndex },
@@ -1432,6 +1450,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         (&exit_evt, Token::Exit),
         (&reset_evt, Token::Reset),
         (&crash_evt, Token::Crash),
+        (&panic_rdtube, Token::Panic),
         (&linux.suspend_evt, Token::Suspend),
         (&sigchld_fd, Token::ChildSignal),
     ])
@@ -1603,6 +1622,26 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     info!("vcpu crashed");
                     exit_state = ExitState::Crash;
                     break 'wait;
+                }
+                Token::Panic => {
+                    let mut break_to_wait: bool = true;
+                    match panic_rdtube.recv::<u8>() {
+                        Ok(panic_code) => {
+                            let panic_code = PvPanicCode::from_u8(panic_code);
+                            info!("Guest reported panic [Code: {}]", panic_code);
+                            if panic_code == PvPanicCode::CrashLoaded {
+                                // VM is booting to crash kernel.
+                                break_to_wait = false;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("failed to recv panic event: {} ", e);
+                        }
+                    }
+                    if break_to_wait {
+                        exit_state = ExitState::GuestPanic;
+                        break 'wait;
+                    }
                 }
                 Token::Suspend => {
                     info!("VM requested suspend");

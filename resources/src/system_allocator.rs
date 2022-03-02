@@ -29,7 +29,7 @@ pub struct SystemAllocatorConfig {
     /// IO ports. Only for x86_64.
     pub io: Option<MemRegion>,
     /// Low (<=4GB) MMIO region.
-    pub low_mmio: Vec<MemRegion>,
+    pub low_mmio: MemRegion,
     /// High (>4GB) MMIO region.
     pub high_mmio: MemRegion,
     /// Platform MMIO space. Only for ARM.
@@ -53,37 +53,12 @@ pub struct SystemAllocator {
 }
 
 impl SystemAllocator {
-    /// Creates a new `SystemAllocator` for managing addresses and irq numvers.
-    /// Can return `None` if `base` + `size` overflows a u64 or if alignment isn't a power
-    /// of two.
+    /// Creates a new `SystemAllocator` for managing addresses and irq numbers.
+    /// Will return an error if `base` + `size` overflows u64 (or allowed
+    /// maximum for the specific type), or if alignment isn't a power of two.
     ///
     pub fn new(config: SystemAllocatorConfig) -> Result<Self> {
         let page_size = pagesize() as u64;
-
-        if config.low_mmio.len() < 1 {
-            return Err(Error::MissingLowMMIOAddresses);
-        }
-
-        let mut mmio_low_allocator = AddressAllocator::new(
-            config.low_mmio[0].base,
-            config.low_mmio[0].size,
-            Some(page_size),
-            None,
-        )?;
-        for mem_region in config.low_mmio.iter().skip(1) {
-            mmio_low_allocator.insert_to_free_pool_at(mem_region.base, mem_region.size)?;
-        }
-        let mmio_address_spaces = [
-            // MmioType::Low
-            mmio_low_allocator,
-            // MmioType::High
-            AddressAllocator::new(
-                config.high_mmio.base,
-                config.high_mmio.size,
-                Some(page_size),
-                None,
-            )?,
-        ];
 
         Ok(SystemAllocator {
             io_address_space: if let Some(io) = config.io {
@@ -96,7 +71,22 @@ impl SystemAllocator {
             } else {
                 None
             },
-            mmio_address_spaces,
+            mmio_address_spaces: [
+                // MmioType::Low
+                AddressAllocator::new(
+                    config.low_mmio.base,
+                    config.low_mmio.size,
+                    Some(page_size),
+                    None,
+                )?,
+                // MmioType::High
+                AddressAllocator::new(
+                    config.high_mmio.base,
+                    config.high_mmio.size,
+                    Some(page_size),
+                    None,
+                )?,
+            ],
 
             pci_allocator: BTreeMap::new(),
 
@@ -259,10 +249,10 @@ mod tests {
                 base: 0x1000,
                 size: 0xf000,
             }),
-            low_mmio: vec![MemRegion {
+            low_mmio: MemRegion {
                 base: 0x3000_0000,
                 size: 0x1_0000,
-            }],
+            },
             high_mmio: MemRegion {
                 base: 0x1000_0000,
                 size: 0x1000_0000,
@@ -295,65 +285,6 @@ mod tests {
                 bar: 0
             }),
             Some(&(0x10000000, 0x100, "bar0".to_string()))
-        );
-    }
-
-    #[test]
-    fn missing_low_iommu() {
-        assert!(SystemAllocator::new(SystemAllocatorConfig {
-            io: Some(MemRegion {
-                base: 0x1000,
-                size: 0xf000,
-            }),
-            low_mmio: vec![],
-            high_mmio: MemRegion {
-                base: 0x1000_0000,
-                size: 0x1000_0000,
-            },
-            platform_mmio: None,
-            first_irq: 5,
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn pool_behavior() {
-        let mut a = SystemAllocator::new(SystemAllocatorConfig {
-            io: Some(MemRegion {
-                base: 0x1000,
-                size: 0xf000,
-            }),
-            low_mmio: vec![
-                MemRegion {
-                    base: 0x3000_0000,
-                    size: 0x1_0000,
-                },
-                MemRegion {
-                    base: 0x0000,
-                    size: 0x1000,
-                },
-            ],
-            high_mmio: MemRegion {
-                base: 0x1000_0000,
-                size: 0x1000_0000,
-            },
-            platform_mmio: None,
-            first_irq: 5,
-        })
-        .unwrap();
-
-        // pool_base and pool_size just returns the region for first entry
-        // because it doesn't make sense to try to return noncontiguous memory.
-        assert_eq!(a.mmio_allocator(MmioType::Low).pool_base(), 0x3000_0000);
-        assert_eq!(a.mmio_allocator(MmioType::Low).pool_size(), 0x1_0000);
-        assert_eq!(
-            a.mmio_allocator(MmioType::Low).allocate_at(
-                0,
-                0x1000,
-                Alloc::Anon(0),
-                String::from("test")
-            ),
-            Ok(())
         );
     }
 }

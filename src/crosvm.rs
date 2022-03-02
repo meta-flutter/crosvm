@@ -434,6 +434,7 @@ pub struct Config {
     pub dmi_path: Option<PathBuf>,
     pub no_legacy: bool,
     pub host_cpu_topology: bool,
+    pub privileged_vm: bool,
     pub stub_pci_devices: Vec<StubPciParameters>,
     pub vvu_proxy: Vec<VvuOption>,
     pub coiommu_param: Option<devices::CoIommuParameters>,
@@ -444,6 +445,7 @@ pub struct Config {
     pub rng: bool,
     pub pivot_root: Option<PathBuf>,
     pub force_s2idle: bool,
+    pub strict_balloon: bool,
 }
 
 impl Default for Config {
@@ -549,6 +551,7 @@ impl Default for Config {
             dmi_path: None,
             no_legacy: false,
             host_cpu_topology: false,
+            privileged_vm: false,
             stub_pci_devices: Vec::new(),
             coiommu_param: None,
             file_backed_mappings: Vec::new(),
@@ -558,6 +561,7 @@ impl Default for Config {
             rng: true,
             pivot_root: None,
             force_s2idle: false,
+            strict_balloon: false,
         }
     }
 }

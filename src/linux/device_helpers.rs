@@ -6,13 +6,19 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 use std::os::unix::net::UnixListener;
 use std::os::unix::{io::FromRawFd, net::UnixStream, prelude::OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 
+use crate::{
+    Config, DiskOption, TouchDeviceOption, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
+    VhostVsockDeviceParameter, VvuOption,
+};
 use anyhow::{anyhow, bail, Context, Result};
+use arch::{self, VirtioDeviceStub};
 use base::*;
 use devices::serial_device::SerialParameters;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
@@ -40,12 +46,6 @@ use net_util::{MacAddress, Tap};
 use resources::{Alloc, MmioType, SystemAllocator};
 use sync::Mutex;
 use vm_memory::GuestAddress;
-
-use crate::{
-    Config, DiskOption, TouchDeviceOption, VhostUserFsOption, VhostUserOption, VhostUserWlOption,
-    VhostVsockDeviceParameter, VvuOption,
-};
-use arch::{self, VirtioDeviceStub};
 
 use super::jail_helpers::*;
 
@@ -994,15 +994,19 @@ pub fn create_iommu_device(
     cfg: &Config,
     phys_max_addr: u64,
     endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
+    hp_endpoints_ranges: Vec<RangeInclusive<u32>>,
     translate_response_senders: Option<BTreeMap<u32, Tube>>,
     translate_request_rx: Option<Tube>,
+    iommu_device_tube: Tube,
 ) -> DeviceResult {
     let dev = virtio::Iommu::new(
         virtio::base_features(cfg.protected_vm),
         endpoints,
         phys_max_addr,
+        hp_endpoints_ranges,
         translate_response_senders,
         translate_request_rx,
+        Some(iommu_device_tube),
     )
     .context("failed to create IOMMU device")?;
 

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::thread;
 use std::u32;
 
-use base::{error, pagesize, AsRawDescriptor, Event, PollToken, RawDescriptor, Tube, WaitContext};
+use base::{
+    error, pagesize, warn, AsRawDescriptor, Event, PollToken, RawDescriptor, Tube, WaitContext,
+};
 use hypervisor::{Datamatch, MemSlot};
 
 use resources::{Alloc, MmioType, SystemAllocator};
@@ -1282,7 +1284,9 @@ impl PciDevice for VfioPciDevice {
         resources: &mut SystemAllocator,
     ) -> Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
-            let mut address = PciAddress::from_string(self.device.device_name());
+            let mut address = PciAddress::from_string(self.device.device_name()).map_err(|e| {
+                PciDeviceError::PciAddressParseFailure(self.device.device_name().clone(), e)
+            })?;
             if let Some(bus_num) = self.hotplug_bus_number {
                 // Caller specify pcie bus number for hotplug device
                 address.bus = bus_num;
@@ -1588,6 +1592,23 @@ impl PciDevice for VfioPciDevice {
                 }
             }
         }
+    }
+
+    fn read_virtual_config_register(&self, reg_idx: usize) -> u32 {
+        warn!(
+            "{} read unsupported register {}",
+            self.debug_label(),
+            reg_idx
+        );
+        0
+    }
+
+    fn write_virtual_config_register(&mut self, reg_idx: usize, _value: u32) {
+        warn!(
+            "{} write unsupported register {}",
+            self.debug_label(),
+            reg_idx
+        )
     }
 
     fn read_bar(&mut self, addr: u64, data: &mut [u8]) {

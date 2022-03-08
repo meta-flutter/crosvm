@@ -16,7 +16,7 @@ use crate::pci::pci_configuration::{
     self, PciBarConfiguration, BAR0_REG, COMMAND_REG, COMMAND_REG_IO_SPACE_MASK,
     COMMAND_REG_MEMORY_SPACE_MASK, NUM_BAR_REGS, ROM_BAR_REG,
 };
-use crate::pci::{PciAddress, PciInterruptPin};
+use crate::pci::{PciAddress, PciAddressError, PciInterruptPin};
 use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
 #[cfg(feature = "audio")]
 use crate::virtio::snd::vios_backend::Error as VioSError;
@@ -57,6 +57,9 @@ pub enum Error {
     /// PCI Address is not allocated.
     #[error("PCI address is not allocated")]
     PciAddressMissing,
+    /// PCI Address parsing failure.
+    #[error("PCI address '{0}' could not be parsed: {1}")]
+    PciAddressParseFailure(String, PciAddressError),
     /// PCI Address allocation failure.
     #[error("failed to allocate PCI address")]
     PciAllocationFailed,
@@ -135,6 +138,17 @@ pub trait PciDevice: Send {
     /// * `offset`  - byte offset within 4-byte register.
     /// * `data`    - The data to write.
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]);
+
+    /// Reads from a virtual config register.
+    /// * `reg_idx` - virtual config register index (in units of 4 bytes).
+    fn read_virtual_config_register(&self, _reg_idx: usize) -> u32 {
+        0
+    }
+
+    /// Writes to a virtual config register.
+    /// * `reg_idx` - virtual config register index (in units of 4 bytes).
+    /// * `value`   - the value to be written.
+    fn write_virtual_config_register(&mut self, _reg_idx: usize, _value: u32) {}
 
     /// Reads from a BAR region mapped in to the device.
     /// * `addr` - The guest address inside the BAR.
@@ -297,6 +311,14 @@ impl<T: PciDevice> BusDevice for T {
         self.read_config_register(reg_idx)
     }
 
+    fn virtual_config_register_write(&mut self, reg_idx: usize, value: u32) {
+        self.write_virtual_config_register(reg_idx, value);
+    }
+
+    fn virtual_config_register_read(&self, reg_idx: usize) -> u32 {
+        self.read_virtual_config_register(reg_idx)
+    }
+
     fn on_sandboxed(&mut self) {
         self.on_device_sandboxed();
     }
@@ -361,6 +383,12 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     }
     fn ioevents(&self) -> Vec<(&Event, u64, Datamatch)> {
         (**self).ioevents()
+    }
+    fn read_virtual_config_register(&self, reg_idx: usize) -> u32 {
+        (**self).read_virtual_config_register(reg_idx)
+    }
+    fn write_virtual_config_register(&mut self, reg_idx: usize, value: u32) {
+        (**self).write_virtual_config_register(reg_idx, value)
     }
     fn read_config_register(&self, reg_idx: usize) -> u32 {
         (**self).read_config_register(reg_idx)

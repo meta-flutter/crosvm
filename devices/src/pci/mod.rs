@@ -27,6 +27,7 @@ mod vfio_pci;
 pub use self::ac97::{Ac97Backend, Ac97Dev, Ac97Parameters};
 pub use self::coiommu::{CoIommuDev, CoIommuParameters, CoIommuUnpinPolicy};
 pub use self::msix::{MsixCap, MsixConfig, MsixStatus};
+pub use self::pci_address::Error as PciAddressError;
 pub use self::pci_address::PciAddress;
 pub use self::pci_configuration::{
     PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType, PciCapability,
@@ -34,7 +35,7 @@ pub use self::pci_configuration::{
     PciProgrammingInterface, PciSerialBusSubClass, PciSubclass, CAPABILITY_LIST_HEAD_OFFSET,
 };
 pub use self::pci_device::{BarRange, Error as PciDeviceError, PciDevice};
-pub use self::pci_root::{PciConfigIo, PciConfigMmio, PciRoot};
+pub use self::pci_root::{PciConfigIo, PciConfigMmio, PciRoot, PciVirtualConfigMmio};
 pub use self::pcie::{PciBridge, PcieHostRootPort, PcieRootPort};
 pub use self::pvpanic::{PvPanicCode, PvPanicPciDevice};
 pub use self::stub::{StubPciDevice, StubPciParameters};

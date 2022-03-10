@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::cmp::{max, Reverse};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
@@ -27,8 +27,8 @@ use libc;
 use acpi_tables::sdt::SDT;
 
 use anyhow::{anyhow, bail, Context, Result};
-use base::net::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use base::*;
+use base::{UnixSeqpacket, UnixSeqpacketListener, UnlinkUnixSeqpacketListener};
 use devices::serial_device::SerialHardware;
 use devices::vfio::{VfioCommonSetup, VfioCommonTrait};
 use devices::virtio::memory_mapper::MemoryMapperTrait;
@@ -55,7 +55,7 @@ use vm_memory::{GuestAddress, GuestMemory, MemoryPolicy};
 
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use crate::gdb::{gdb_thread, GdbStub};
-use crate::{Config, Executable, SharedDir, SharedDirKind, VfioType};
+use crate::{Config, Executable, FileBackedMappingParameters, SharedDir, SharedDirKind, VfioType};
 use arch::{
     self, LinuxArch, RunnableLinuxVm, VcpuAffinity, VirtioDeviceStub, VmComponents, VmImage,
 };
@@ -640,15 +640,19 @@ fn create_file_backed_mappings(
             .build()
             .context("failed to map backing file for file-backed mapping")?;
 
-        resources
-            .mmio_allocator_any()
-            .allocate_at(
-                mapping.address,
-                mapping.size,
-                Alloc::FileBacked(mapping.address),
-                "file-backed mapping".to_owned(),
-            )
-            .context("failed to allocate guest address for file-backed mapping")?;
+        match resources.mmio_allocator_any().allocate_at(
+            mapping.address,
+            mapping.size,
+            Alloc::FileBacked(mapping.address),
+            "file-backed mapping".to_owned(),
+        ) {
+            // OutOfSpace just means that this mapping is not in the MMIO regions at all, so don't
+            // consider it an error.
+            // TODO(b/222769529): Reserve this region in a global memory address space allocator once
+            // we have that so nothing else can accidentally overlap with it.
+            Ok(()) | Err(resources::Error::OutOfSpace) => {}
+            e => e.context("failed to allocate guest address for file-backed mapping")?,
+        }
 
         vm.add_memory_region(
             GuestAddress(mapping.address),
@@ -871,11 +875,58 @@ pub enum ExitState {
     GuestPanic,
 }
 
+// Remove ranges in `guest_mem_layout` that overlap with ranges in `file_backed_mappings`.
+// Returns the updated guest memory layout.
+fn punch_holes_in_guest_mem_layout_for_mappings(
+    guest_mem_layout: Vec<(GuestAddress, u64)>,
+    file_backed_mappings: &[FileBackedMappingParameters],
+) -> Vec<(GuestAddress, u64)> {
+    // Create a set containing (start, end) pairs with exclusive end (end = start + size; the byte
+    // at end is not included in the range).
+    let mut layout_set = BTreeSet::new();
+    for (addr, size) in &guest_mem_layout {
+        layout_set.insert((addr.offset(), addr.offset() + size));
+    }
+
+    for mapping in file_backed_mappings {
+        let mapping_start = mapping.address;
+        let mapping_end = mapping_start + mapping.size;
+
+        // Repeatedly split overlapping guest memory regions until no overlaps remain.
+        while let Some((range_start, range_end)) = layout_set
+            .iter()
+            .find(|&&(range_start, range_end)| {
+                mapping_start < range_end && mapping_end > range_start
+            })
+            .cloned()
+        {
+            layout_set.remove(&(range_start, range_end));
+
+            if range_start < mapping_start {
+                layout_set.insert((range_start, mapping_start));
+            }
+            if range_end > mapping_end {
+                layout_set.insert((mapping_end, range_end));
+            }
+        }
+    }
+
+    // Build the final guest memory layout from the modified layout_set.
+    layout_set
+        .iter()
+        .map(|(start, end)| (GuestAddress(*start), end - start))
+        .collect()
+}
+
 pub fn run_config(cfg: Config) -> Result<ExitState> {
     let components = setup_vm_components(&cfg)?;
 
     let guest_mem_layout =
         Arch::guest_memory_layout(&components).context("failed to create guest memory layout")?;
+
+    let guest_mem_layout =
+        punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
+
     let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
     let mut mem_policy = MemoryPolicy::empty();
     if components.hugepages {
@@ -1805,6 +1856,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             balloon_host_tube.as_ref(),
                                             &mut balloon_stats_id,
                                             disk_host_tubes,
+                                            &mut linux.pm,
                                             #[cfg(feature = "usb")]
                                             Some(&usb_control_tube),
                                             #[cfg(not(feature = "usb"))]
@@ -2034,4 +2086,162 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .expect("failed to restore canonical mode for terminal");
 
     Ok(exit_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Create a file-backed mapping parameters struct with the given `address` and `size` and other
+    // parameters set to default values.
+    fn test_file_backed_mapping(address: u64, size: u64) -> FileBackedMappingParameters {
+        FileBackedMappingParameters {
+            address,
+            size,
+            path: PathBuf::new(),
+            offset: 0,
+            writable: false,
+            sync: false,
+        }
+    }
+
+    #[test]
+    fn guest_mem_file_backed_mappings_overlap() {
+        // Base case: no file mappings; output layout should be identical.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping that does not overlap guest memory.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xD000_0000, 0x1000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the start of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0x2000), 0xD000_0000 - 0x2000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the end of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xD000_0000 - 0x2000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000 - 0x2000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping fully contained within the middle of the low address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0x1000),
+                (GuestAddress(0x3000), 0xD000_0000 - 0x3000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000),
+            ]
+        );
+
+        // File mapping at the start of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0000_0000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+            ]
+        );
+
+        // File mapping at the end of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0008_0000 - 0x2000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x8_0000 - 0x2000),
+            ]
+        );
+
+        // File mapping fully contained within the middle of the high address space region.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0x1_0000_1000, 0x2000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xD000_0000),
+                (GuestAddress(0x1_0000_0000), 0x1000),
+                (GuestAddress(0x1_0000_3000), 0x8_0000 - 0x3000),
+            ]
+        );
+
+        // File mapping overlapping two guest memory regions.
+        assert_eq!(
+            punch_holes_in_guest_mem_layout_for_mappings(
+                vec![
+                    (GuestAddress(0), 0xD000_0000),
+                    (GuestAddress(0x1_0000_0000), 0x8_0000),
+                ],
+                &[test_file_backed_mapping(0xA000_0000, 0x60002000)]
+            ),
+            vec![
+                (GuestAddress(0), 0xA000_0000),
+                (GuestAddress(0x1_0000_2000), 0x8_0000 - 0x2000),
+            ]
+        );
+    }
 }

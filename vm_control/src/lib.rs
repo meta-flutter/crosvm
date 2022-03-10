@@ -107,6 +107,11 @@ impl Default for VmRunMode {
     }
 }
 
+pub trait PmResource {
+    fn pwrbtn_evt(&mut self) {}
+    fn gpe_evt(&mut self, _gpe: u32) {}
+}
+
 /// The maximum number of devices that can be listed in one `UsbControlCommand`.
 ///
 /// This value was set to be equal to `xhci_regs::MAX_PORTS` for convenience, but it is not
@@ -879,10 +884,14 @@ impl FsMappingRequest {
 pub enum VmRequest {
     /// Break the VM's run loop and exit.
     Exit,
+    /// Trigger a power button event in the guest.
+    Powerbtn,
     /// Suspend the VM's VCPUs until resume.
     Suspend,
     /// Resume the VM's VCPUs that were previously suspended.
     Resume,
+    /// Inject a general-purpose event.
+    Gpe(u32),
     /// Make the VM's RT VCPU real-time.
     MakeRT,
     /// Command for balloon driver.
@@ -963,6 +972,7 @@ impl VmRequest {
         balloon_host_tube: Option<&Tube>,
         balloon_stats_id: &mut u64,
         disk_host_tubes: &[Tube],
+        pm: &mut Option<Arc<Mutex<dyn PmResource>>>,
         usb_control_tube: Option<&Tube>,
         bat_control: &mut Option<BatControl>,
         vcpu_handles: &[(JoinHandle<()>, mpsc::Sender<VcpuControl>)],
@@ -972,6 +982,15 @@ impl VmRequest {
                 *run_mode = Some(VmRunMode::Exiting);
                 VmResponse::Ok
             }
+            VmRequest::Powerbtn => {
+                if pm.is_some() {
+                    pm.as_ref().unwrap().lock().pwrbtn_evt();
+                    VmResponse::Ok
+                } else {
+                    error!("{:#?} not supported", *self);
+                    VmResponse::Err(SysError::new(ENOTSUP))
+                }
+            }
             VmRequest::Suspend => {
                 *run_mode = Some(VmRunMode::Suspending);
                 VmResponse::Ok
@@ -979,6 +998,15 @@ impl VmRequest {
             VmRequest::Resume => {
                 *run_mode = Some(VmRunMode::Running);
                 VmResponse::Ok
+            }
+            VmRequest::Gpe(gpe) => {
+                if pm.is_some() {
+                    pm.as_ref().unwrap().lock().gpe_evt(gpe);
+                    VmResponse::Ok
+                } else {
+                    error!("{:#?} not supported", *self);
+                    VmResponse::Err(SysError::new(ENOTSUP))
+                }
             }
             VmRequest::MakeRT => {
                 for (handle, channel) in vcpu_handles {

@@ -7,6 +7,7 @@
 use arch::LinuxArch;
 use devices::IrqChipX86_64;
 use hypervisor::{HypervisorX86_64, ProtectionType, VcpuExit, VcpuX86_64, VmX86_64};
+use resources::SystemAllocator;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use super::cpuid::setup_cpuid;
@@ -102,7 +103,9 @@ where
     let guest_mem = GuestMemory::new(&arch_mem_regions).unwrap();
 
     let (hyp, mut vm) = create_vm(guest_mem.clone());
-    let mut resources = X8664arch::create_system_allocator(&vm);
+    let mut resources =
+        SystemAllocator::new(X8664arch::get_system_allocator_config(&vm), None, &[])
+            .expect("failed to create system allocator");
     let (irqchip_tube, device_tube) = Tube::pair().expect("failed to create irq tube");
 
     let mut irq_chip = create_irq_chip(vm.try_clone().expect("failed to clone vm"), 1, device_tube);
@@ -183,7 +186,6 @@ where
     let suspend_evt = Event::new().unwrap();
     let mut resume_notify_devices = Vec::new();
     let acpi_dev_resource = X8664arch::setup_acpi_devices(
-        &vm,
         &guest_mem,
         &io_bus,
         &mut resources,

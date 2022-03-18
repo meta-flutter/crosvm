@@ -46,6 +46,7 @@ mod regs;
 mod smbios;
 
 use std::collections::BTreeMap;
+use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Seek};
@@ -137,8 +138,6 @@ pub enum Error {
     LoadKernel(kernel_loader::Error),
     #[error("error translating address: Page not present")]
     PageNotPresent,
-    #[error("failed to allocate pstore region: {0}")]
-    Pstore(arch::pstore::Error),
     #[error("error reading guest memory {0}")]
     ReadingGuestMemory(vm_memory::GuestMemoryError),
     #[error("error reading CPU registers {0}")]
@@ -391,11 +390,11 @@ impl arch::LinuxArch for X8664arch {
         Ok(arch_memory_regions(components.memory_size, bios_size))
     }
 
-    fn create_system_allocator<V: Vm>(vm: &V) -> SystemAllocator {
+    fn get_system_allocator_config<V: Vm>(vm: &V) -> SystemAllocatorConfig {
         let guest_mem = vm.get_memory();
         let high_mmio_start = Self::get_high_mmio_base(guest_mem);
         let high_mmio_size = Self::get_high_mmio_size(vm);
-        SystemAllocator::new(SystemAllocatorConfig {
+        SystemAllocatorConfig {
             io: Some(MemRegion {
                 base: 0xc000,
                 size: 0x4000,
@@ -410,8 +409,7 @@ impl arch::LinuxArch for X8664arch {
             },
             platform_mmio: None,
             first_irq: X86_64_IRQ_BASE,
-        })
-        .unwrap()
+        }
     }
 
     fn build_vm<V, Vcpu>(
@@ -532,7 +530,6 @@ impl arch::LinuxArch for X8664arch {
         let max_bus = ((PCIE_CFG_MMIO_SIZE / 0x100000) - 1) as u8;
 
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
-            &vm,
             &mem,
             &io_bus,
             system_allocator,
@@ -1264,8 +1261,7 @@ impl X8664arch {
     /// * - `irq_chip` the IrqChip object for registering irq events
     /// * - `battery` indicate whether to create the battery
     /// * - `mmio_bus` the MMIO bus to add the devices to
-    fn setup_acpi_devices<V: VmX86_64>(
-        vm: &V,
+    fn setup_acpi_devices(
         mem: &GuestMemory,
         io_bus: &devices::Bus,
         resources: &mut SystemAllocator,
@@ -1305,6 +1301,28 @@ impl X8664arch {
         let pmresource = devices::ACPIPMResource::new(pm_sci_evt, suspend_evt, exit_evt);
         pmresource.to_aml_bytes(&mut amls);
 
+        let mut crs_entries: Vec<Box<dyn Aml>> = vec![
+            Box::new(aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16)),
+            Box::new(aml::IO::new(0xcf8, 0xcf8, 1, 0x8)),
+        ];
+        for r in resources.mmio_pools() {
+            let entry: Box<dyn Aml> = match (u32::try_from(*r.start()), u32::try_from(*r.end())) {
+                (Ok(start), Ok(end)) => Box::new(aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    start,
+                    end,
+                )),
+                _ => Box::new(aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCachable::NotCacheable,
+                    true,
+                    *r.start(),
+                    *r.end(),
+                )),
+            };
+            crs_entries.push(entry);
+        }
+
         let mut pci_dsdt_inner_data: Vec<&dyn aml::Aml> = Vec::new();
         let hid = aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A08"));
         pci_dsdt_inner_data.push(&hid);
@@ -1320,22 +1338,7 @@ impl X8664arch {
         pci_dsdt_inner_data.push(&supp);
         let crs = aml::Name::new(
             "_CRS".into(),
-            &aml::ResourceTemplate::new(vec![
-                &aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16),
-                &aml::IO::new(0xcf8, 0xcf8, 1, 0x8),
-                &aml::AddressSpace::new_memory(
-                    aml::AddressSpaceCachable::NotCacheable,
-                    true,
-                    END_ADDR_BEFORE_32BITS as u32,
-                    (END_ADDR_BEFORE_32BITS + PCI_MMIO_SIZE - 1) as u32,
-                ),
-                &aml::AddressSpace::new_memory(
-                    aml::AddressSpaceCachable::NotCacheable,
-                    true,
-                    Self::get_high_mmio_base(mem),
-                    Self::get_high_mmio_size(vm),
-                ),
-            ]),
+            &aml::ResourceTemplate::new(crs_entries.iter().map(|b| b.as_ref()).collect()),
         );
         pci_dsdt_inner_data.push(&crs);
 

@@ -12,6 +12,8 @@ use std::default::Default;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::ops::Deref;
+#[cfg(feature = "direct")]
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::string::String;
@@ -23,7 +25,7 @@ use base::{debug, error, getpid, info, kill_process_group, pagesize, reap_child,
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 use crosvm::platform::GpuRenderServerParameters;
 #[cfg(feature = "direct")]
-use crosvm::DirectIoOption;
+use crosvm::{argument::parse_hex_or_decimal, DirectIoOption};
 use crosvm::{
     argument::{self, print_help, set_arguments, Argument},
     platform, BindMount, Config, DiskOption, Executable, FileBackedMappingParameters, GidMap,
@@ -903,16 +905,6 @@ fn parse_battery_options(s: Option<&str>) -> argument::Result<BatteryType> {
     }
 
     Ok(battery_type)
-}
-
-#[cfg(feature = "direct")]
-fn parse_hex_or_decimal(maybe_hex_string: &str) -> Result<u64, std::num::ParseIntError> {
-    // Parse string starting with 0x as hex and others as numbers.
-    let without_prefix = maybe_hex_string.strip_prefix("0x");
-    match without_prefix {
-        Some(hex_string) => u64::from_str_radix(hex_string, 16),
-        None => u64::from_str(maybe_hex_string),
-    }
 }
 
 #[cfg(feature = "direct")]
@@ -2406,6 +2398,35 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "strict-balloon" => {
             cfg.strict_balloon = true;
         }
+        #[cfg(feature = "direct")]
+        "mmio-address-range" => {
+            let ranges: argument::Result<Vec<RangeInclusive<u64>>> = value
+                .unwrap()
+                .split(",")
+                .map(|s| {
+                    let r: Vec<&str> = s.split("-").collect();
+                    if r.len() != 2 {
+                        return Err(argument::Error::InvalidValue {
+                            value: s.to_string(),
+                            expected: String::from("invalid range"),
+                        });
+                    }
+                    let parse = |s: &str| -> argument::Result<u64> {
+                        match parse_hex_or_decimal(s) {
+                            Ok(v) => Ok(v),
+                            Err(_) => {
+                                return Err(argument::Error::InvalidValue {
+                                    value: s.to_owned(),
+                                    expected: String::from("expected u64 value"),
+                                });
+                            }
+                        }
+                    };
+                    Ok(RangeInclusive::new(parse(r[0])?, parse(r[1])?))
+                })
+                .collect();
+            cfg.mmio_address_ranges = ranges?;
+        }
         "help" => return Err(argument::Error::PrintHelp),
         _ => unreachable!(),
     }
@@ -2793,6 +2814,10 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("s2idle", "Set Low Power S0 Idle Capable Flag for guest Fixed ACPI Description Table"),
           Argument::flag("strict-balloon", "Don't allow guest to use pages from the balloon"),
+          Argument::value("mmio-address-range", "STARTADDR-ENDADDR[,STARTADDR-ENDADDR]*",
+                          "Ranges (inclusive) into which to limit guest mmio addresses. Note that
+                           this this may cause mmio allocations to fail if the specified ranges are
+                           incompatible with the default ranges calculated by crosvm."),
           Argument::short_flag('h', "help", "Print help message.")];
 
     let mut cfg = Config::default();
@@ -3079,10 +3104,11 @@ fn create_composite(mut args: std::env::Args) -> std::result::Result<(), ()> {
             if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
                 let partition_file = File::open(path)
                     .map_err(|e| error!("Failed to open partition image: {}", e))?;
-                let size = create_disk_file(partition_file, disk::MAX_NESTING_DEPTH)
-                    .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
-                    .get_len()
-                    .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
+                let size =
+                    create_disk_file(partition_file, disk::MAX_NESTING_DEPTH, Path::new(path))
+                        .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
+                        .get_len()
+                        .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
                 Ok(PartitionInfo {
                     label: label.to_owned(),
                     path: Path::new(path).to_owned(),

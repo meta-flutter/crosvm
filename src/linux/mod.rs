@@ -95,7 +95,7 @@ fn create_virtio_devices(
     _exit_evt: &Event,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
-    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
+    vhost_user_gpu_tubes: Vec<(Tube, Tube, Tube)>,
     balloon_device_tube: Option<Tube>,
     balloon_inflate_tube: Option<Tube>,
     init_balloon_size: u64,
@@ -109,12 +109,14 @@ fn create_virtio_devices(
     let mut devs = Vec::new();
 
     #[cfg(feature = "gpu")]
-    for (opt, (host_tube, device_tube)) in cfg.vhost_user_gpu.iter().zip(vhost_user_gpu_tubes) {
+    for (opt, (host_gpu_tube, device_gpu_tube, device_control_tube)) in
+        cfg.vhost_user_gpu.iter().zip(vhost_user_gpu_tubes)
+    {
         devs.push(create_vhost_user_gpu_device(
             cfg,
             opt,
-            host_tube,
-            device_tube,
+            (host_gpu_tube, device_gpu_tube),
+            device_control_tube,
         )?);
     }
 
@@ -453,7 +455,8 @@ fn create_devices(
     control_tubes: &mut Vec<TaggedControlTube>,
     wayland_device_tube: Tube,
     gpu_device_tube: Tube,
-    vhost_user_gpu_tubes: Vec<(Tube, Tube)>,
+    // Tuple content: (host-side GPU tube, device-side GPU tube, device-side control tube).
+    vhost_user_gpu_tubes: Vec<(Tube, Tube, Tube)>,
     balloon_device_tube: Option<Tube>,
     init_balloon_size: u64,
     disk_device_tubes: &mut Vec<Tube>,
@@ -1039,12 +1042,11 @@ where
 
     let mut vhost_user_gpu_tubes = Vec::with_capacity(cfg.vhost_user_gpu.len());
     for _ in 0..cfg.vhost_user_gpu.len() {
-        let (host_tube, device_tube) = Tube::pair().context("failed to create tube")?;
-        vhost_user_gpu_tubes.push((
-            host_tube.try_clone().context("failed to clone tube")?,
-            device_tube,
-        ));
-        control_tubes.push(TaggedControlTube::VmMemory(host_tube));
+        let (host_control_tube, device_control_tube) =
+            Tube::pair().context("failed to create tube")?;
+        let (host_gpu_tube, device_gpu_tube) = Tube::pair().context("failed to create tube")?;
+        vhost_user_gpu_tubes.push((host_gpu_tube, device_gpu_tube, device_control_tube));
+        control_tubes.push(TaggedControlTube::VmMemory(host_control_tube));
     }
 
     let (wayland_host_tube, wayland_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1154,13 +1156,23 @@ where
     let reset_evt = Event::new().context("failed to create event")?;
     let crash_evt = Event::new().context("failed to create event")?;
     let (panic_rdtube, panic_wrtube) = Tube::pair().context("failed to create tube")?;
-    let mut sys_allocator = Arch::create_system_allocator(&vm);
 
-    // Allocate the ramoops region first. AArch64::build_vm() assumes this.
+    let pstore_size = components.pstore.as_ref().map(|pstore| pstore.size as u64);
+    let mut sys_allocator = SystemAllocator::new(
+        Arch::get_system_allocator_config(&vm),
+        pstore_size,
+        &cfg.mmio_address_ranges,
+    )
+    .context("failed to create system allocator")?;
+
     let ramoops_region = match &components.pstore {
         Some(pstore) => Some(
-            arch::pstore::create_memory_region(&mut vm, &mut sys_allocator, pstore)
-                .context("failed to allocate pstore region")?,
+            arch::pstore::create_memory_region(
+                &mut vm,
+                sys_allocator.reserved_region().unwrap(),
+                pstore,
+            )
+            .context("failed to allocate pstore region")?,
         ),
         None => None,
     };
@@ -1575,6 +1587,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         IrqFd { index: IrqEventIndex },
         VmControlServer,
         VmControl { index: usize },
+        DelayedIrqFd,
     }
 
     stdin()
@@ -1610,6 +1623,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     for (index, _gsi, evt) in events {
         wait_ctx
             .add(&evt, Token::IrqFd { index })
+            .context("failed to add descriptor to wait context")?;
+    }
+
+    if let Some(delayed_ioapic_irq_trigger) = linux.irq_chip.irq_delayed_event_token()? {
+        wait_ctx
+            .add(&delayed_ioapic_irq_trigger, Token::DelayedIrqFd)
             .context("failed to add descriptor to wait context")?;
     }
 
@@ -1738,10 +1757,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         };
 
-        if let Err(e) = linux.irq_chip.process_delayed_irq_events() {
-            warn!("can't deliver delayed irqs: {}", e);
-        }
-
         let mut vm_control_indices_to_remove = Vec::new();
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
@@ -1808,6 +1823,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 Token::IrqFd { index } => {
                     if let Err(e) = linux.irq_chip.service_irq_event(index) {
                         error!("failed to signal irq {}: {}", index, e);
+                    }
+                }
+                Token::DelayedIrqFd => {
+                    if let Err(e) = linux.irq_chip.process_delayed_irq_events() {
+                        warn!("can't deliver delayed irqs: {}", e);
                     }
                 }
                 Token::VmControlServer => {

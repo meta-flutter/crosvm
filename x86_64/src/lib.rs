@@ -196,18 +196,8 @@ const GB: u64 = 1 << 30;
 
 const BOOT_STACK_POINTER: u64 = 0x8000;
 // Make sure it align to 256MB for MTRR convenient
-const MEM_32BIT_GAP_SIZE: u64 = if cfg!(feature = "direct") {
-    // Allow space for identity mapping coreboot memory regions on the host
-    // which is found at around 7a00_0000 (little bit before 2GB)
-    //
-    // TODO(b/188011323): stop hardcoding sizes and addresses here and instead
-    // determine the memory map from how the VM has been configured via the
-    // command line.
-    2560 * MB
-} else {
-    768 * MB
-};
-const START_OF_RAM_32BITS: u64 = if cfg!(feature = "direct") { 0x1000 } else { 0 };
+const MEM_32BIT_GAP_SIZE: u64 = 1024 * MB;
+const START_OF_RAM_32BITS: u64 = 0;
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 // Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
 const RESERVED_MEM_SIZE: u64 = 0x800_0000;
@@ -1305,10 +1295,12 @@ impl X8664arch {
         pcie_vcfg.to_aml_bytes(&mut amls);
 
         let pm_sci_evt = Event::new().map_err(Error::CreateEvent)?;
+        let pm_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
         irq_chip
-            .register_irq_event(sci_irq, &pm_sci_evt, None)
+            .register_irq_event(sci_irq, &pm_sci_evt, Some(&pm_sci_evt_resample))
             .map_err(Error::RegisterIrqfd)?;
-        let pmresource = devices::ACPIPMResource::new(pm_sci_evt, suspend_evt, exit_evt);
+        let pmresource =
+            devices::ACPIPMResource::new(pm_sci_evt, pm_sci_evt_resample, suspend_evt, exit_evt);
         pmresource.to_aml_bytes(&mut amls);
 
         let mut crs_entries: Vec<Box<dyn Aml>> = vec![

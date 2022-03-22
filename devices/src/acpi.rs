@@ -4,67 +4,477 @@
 
 use crate::{BusAccessInfo, BusDevice, BusResumeDevice};
 use acpi_tables::{aml, aml::Aml};
-use base::{error, warn, Event};
+use base::{error, info, warn, Error as SysError, Event, PollToken, WaitContext};
+use base::{AcpiNotifyEvent, NetlinkGenericSocket};
+use std::sync::Arc;
+use std::thread;
+use sync::Mutex;
+use thiserror::Error;
 use vm_control::PmResource;
+
+#[cfg(feature = "direct")]
+use {std::fs, std::io::Error as IoError, std::path::PathBuf};
+
+#[derive(Error, Debug)]
+pub enum ACPIPMError {
+    /// Creating WaitContext failed.
+    #[error("failed to create wait context: {0}")]
+    CreateWaitContext(SysError),
+    /// Error while waiting for events.
+    #[error("failed to wait for events: {0}")]
+    WaitError(SysError),
+    #[error("Did not find group_id corresponding to acpi_mc_group")]
+    AcpiMcGroupError,
+    #[error("Failed to create and bind NETLINK_GENERIC socket for acpi_mc_group: {0}")]
+    AcpiEventSockError(base::Error),
+}
+
+struct Pm1Resource {
+    status: u16,
+    enable: u16,
+    control: u16,
+}
+
+struct GpeResource {
+    status: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
+    enable: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
+}
+
+#[cfg(feature = "direct")]
+struct DirectGpe {
+    num: u32,
+    path: PathBuf,
+    ready: bool,
+    enabled: bool,
+}
 
 /// ACPI PM resource for handling OS suspend/resume request
 #[allow(dead_code)]
 pub struct ACPIPMResource {
     sci_evt: Event,
     sci_evt_resample: Event,
+    #[cfg(feature = "direct")]
+    sci_direct_evt: Option<(Event, Event)>,
+    #[cfg(feature = "direct")]
+    direct_gpe: Vec<DirectGpe>,
+    kill_evt: Option<Event>,
+    worker_thread: Option<thread::JoinHandle<()>>,
     suspend_evt: Event,
     exit_evt: Event,
-    pm1_status: u16,
-    pm1_enable: u16,
-    pm1_control: u16,
-    gpe0_status: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
-    gpe0_enable: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
+    pm1: Arc<Mutex<Pm1Resource>>,
+    gpe0: Arc<Mutex<GpeResource>>,
 }
 
 impl ACPIPMResource {
     /// Constructs ACPI Power Management Resouce.
+    ///
+    /// `direct_gpe_info` - tuple of host SCI trigger and resample events, and list of direct GPEs
     #[allow(dead_code)]
     pub fn new(
         sci_evt: Event,
         sci_evt_resample: Event,
+        #[cfg(feature = "direct")] direct_gpe_info: Option<(Event, Event, &[u32])>,
         suspend_evt: Event,
         exit_evt: Event,
     ) -> ACPIPMResource {
+        let pm1 = Pm1Resource {
+            status: 0,
+            enable: 0,
+            control: 0,
+        };
+        let gpe0 = GpeResource {
+            status: Default::default(),
+            enable: Default::default(),
+        };
+
+        #[cfg(feature = "direct")]
+        let (sci_direct_evt, direct_gpe) = if let Some(info) = direct_gpe_info {
+            let (trigger_evt, resample_evt, gpes) = info;
+            let gpe_vec = gpes.iter().map(|gpe| DirectGpe::new(*gpe)).collect();
+            (Some((trigger_evt, resample_evt)), gpe_vec)
+        } else {
+            (None, Vec::new())
+        };
+
         ACPIPMResource {
             sci_evt,
             sci_evt_resample,
+            #[cfg(feature = "direct")]
+            sci_direct_evt,
+            #[cfg(feature = "direct")]
+            direct_gpe,
+            kill_evt: None,
+            worker_thread: None,
             suspend_evt,
             exit_evt,
-            pm1_status: 0,
-            pm1_enable: 0,
-            pm1_control: 0,
-            gpe0_status: Default::default(),
-            gpe0_enable: Default::default(),
+            pm1: Arc::new(Mutex::new(pm1)),
+            gpe0: Arc::new(Mutex::new(gpe0)),
         }
     }
 
-    fn pm_sci(&self) {
-        if self.pm1_status
-            & self.pm1_enable
+    pub fn start(&mut self) {
+        let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("failed to create kill Event pair: {}", e);
+                return;
+            }
+        };
+        self.kill_evt = Some(self_kill_evt);
+
+        let sci_resample = self
+            .sci_evt_resample
+            .try_clone()
+            .expect("failed to clone event");
+        let sci_evt = self.sci_evt.try_clone().expect("failed to clone event");
+        let pm1 = self.pm1.clone();
+        let gpe0 = self.gpe0.clone();
+
+        #[cfg(feature = "direct")]
+        let sci_direct_evt = if let Some((trigger, resample)) = &self.sci_direct_evt {
+            Some((
+                trigger.try_clone().expect("failed to clone event"),
+                resample.try_clone().expect("failed to clone event"),
+            ))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "direct")]
+        // Direct GPEs are forwarded via direct SCI forwarding,
+        // not via ACPI netlink events.
+        let acpi_event_ignored_gpe = self.direct_gpe.iter().map(|gpe| gpe.num).collect();
+
+        #[cfg(not(feature = "direct"))]
+        let acpi_event_ignored_gpe = Vec::new();
+
+        let worker_result = thread::Builder::new()
+            .name("ACPI PM worker".to_string())
+            .spawn(move || {
+                if let Err(e) = run_worker(
+                    sci_resample,
+                    kill_evt,
+                    sci_evt,
+                    pm1,
+                    gpe0,
+                    acpi_event_ignored_gpe,
+                    #[cfg(feature = "direct")]
+                    sci_direct_evt,
+                ) {
+                    error!("{}", e);
+                }
+            });
+
+        match worker_result {
+            Err(e) => error!("failed to spawn ACPI PM worker thread: {}", e),
+            Ok(join_handle) => self.worker_thread = Some(join_handle),
+        }
+    }
+}
+
+fn run_worker(
+    sci_resample: Event,
+    kill_evt: Event,
+    sci_evt: Event,
+    pm1: Arc<Mutex<Pm1Resource>>,
+    gpe0: Arc<Mutex<GpeResource>>,
+    acpi_event_ignored_gpe: Vec<u32>,
+    #[cfg(feature = "direct")] sci_direct_evt: Option<(Event, Event)>,
+) -> Result<(), ACPIPMError> {
+    // Get group id corresponding to acpi_mc_group of acpi_event family
+    let nl_groups: u32;
+    match get_acpi_event_group() {
+        Some(group) if group > 0 => {
+            nl_groups = 1 << (group - 1);
+            info!("Listening on acpi_mc_group of acpi_event family");
+        }
+        _ => {
+            return Err(ACPIPMError::AcpiMcGroupError);
+        }
+    }
+
+    let acpi_event_sock = match NetlinkGenericSocket::new(nl_groups) {
+        Ok(acpi_sock) => acpi_sock,
+        Err(e) => {
+            return Err(ACPIPMError::AcpiEventSockError(e));
+        }
+    };
+
+    #[derive(PollToken)]
+    enum Token {
+        AcpiEvent,
+        InterruptResample,
+        #[cfg(feature = "direct")]
+        InterruptTriggerDirect,
+        Kill,
+    }
+
+    let wait_ctx: WaitContext<Token> = WaitContext::build_with(&[
+        (&acpi_event_sock, Token::AcpiEvent),
+        (&sci_resample, Token::InterruptResample),
+        (&kill_evt, Token::Kill),
+    ])
+    .map_err(ACPIPMError::CreateWaitContext)?;
+
+    #[cfg(feature = "direct")]
+    if let Some((ref trigger, _)) = sci_direct_evt {
+        wait_ctx
+            .add(trigger, Token::InterruptTriggerDirect)
+            .map_err(ACPIPMError::CreateWaitContext)?;
+    }
+
+    #[cfg(feature = "direct")]
+    let mut pending_sci_direct_resample: Option<&Event> = None;
+
+    loop {
+        let events = wait_ctx.wait().map_err(ACPIPMError::WaitError)?;
+        for event in events.iter().filter(|e| e.is_readable) {
+            match event.token {
+                Token::AcpiEvent => {
+                    acpi_event_run(
+                        &acpi_event_sock,
+                        &gpe0,
+                        &pm1,
+                        &sci_evt,
+                        &acpi_event_ignored_gpe,
+                    );
+                }
+                Token::InterruptResample => {
+                    let _ = sci_resample.read();
+
+                    #[cfg(feature = "direct")]
+                    if let Some(resample) = pending_sci_direct_resample.take() {
+                        if let Err(e) = resample.write(1) {
+                            error!("ACPIPM: failed to resample sci event: {}", e);
+                        }
+                    }
+
+                    // Re-trigger SCI if PM1 or GPE status is still not cleared.
+                    pm1.lock().trigger_sci(&sci_evt);
+                    gpe0.lock().trigger_sci(&sci_evt);
+                }
+                #[cfg(feature = "direct")]
+                Token::InterruptTriggerDirect => {
+                    if let Some((ref trigger, ref resample)) = sci_direct_evt {
+                        let _ = trigger.read();
+
+                        if let Err(e) = sci_evt.write(1) {
+                            error!("ACPIPM: failed to trigger sci event: {}", e);
+                        }
+                        pending_sci_direct_resample = Some(resample);
+                    }
+                }
+                Token::Kill => return Ok(()),
+            }
+        }
+    }
+}
+
+fn acpi_event_gpe_class(
+    gpe_number: u32,
+    _type: u32,
+    gpe0: &Arc<Mutex<GpeResource>>,
+    sci_evt: &Event,
+    ignored_gpe: &[u32],
+) {
+    // If gpe event, emulate GPE and trigger SCI
+    if _type == 0 && gpe_number < 256 && !ignored_gpe.contains(&gpe_number) {
+        let mut gpe0 = gpe0.lock();
+        let byte = gpe_number as usize / 8;
+
+        if byte >= gpe0.status.len() {
+            error!("gpe_evt: GPE register {} does not exist", byte);
+            return;
+        }
+        gpe0.status[byte] |= 1 << (gpe_number % 8);
+        gpe0.trigger_sci(sci_evt);
+    }
+}
+
+const ACPI_BUTTON_NOTIFY_STATUS: u32 = 0x80;
+
+fn acpi_event_pwrbtn_class(
+    acpi_event: AcpiNotifyEvent,
+    pm1: &Arc<Mutex<Pm1Resource>>,
+    sci_evt: &Event,
+) {
+    // If received power button event, emulate PM/PWRBTN_STS and trigger SCI
+    if acpi_event._type == ACPI_BUTTON_NOTIFY_STATUS && acpi_event.bus_id.contains("LNXPWRBN") {
+        let mut pm1 = pm1.lock();
+
+        pm1.status |= BITMASK_PM1STS_PWRBTN_STS;
+        pm1.trigger_sci(sci_evt);
+    }
+}
+
+fn get_acpi_event_group() -> Option<u32> {
+    // Create netlink generic socket which will be used to query about given family name
+    let netlink_ctrl_sock = NetlinkGenericSocket::new(0).unwrap();
+
+    let nlmsg_family_response = netlink_ctrl_sock
+        .family_name_query("acpi_event".to_string())
+        .unwrap();
+    return nlmsg_family_response.get_multicast_group_id("acpi_mc_group".to_string());
+}
+
+fn acpi_event_run(
+    acpi_event_sock: &NetlinkGenericSocket,
+    gpe0: &Arc<Mutex<GpeResource>>,
+    pm1: &Arc<Mutex<Pm1Resource>>,
+    sci_evt: &Event,
+    ignored_gpe: &[u32],
+) {
+    let nl_msg = match acpi_event_sock.recv() {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!("recv returned with error {}", e);
+            return;
+        }
+    };
+
+    for netlink_message in nl_msg.iter() {
+        let acpi_event = match AcpiNotifyEvent::new(netlink_message) {
+            Ok(evt) => evt,
+            Err(e) => {
+                error!("Received netlink message is not an acpi_event, error {}", e);
+                continue;
+            }
+        };
+        match acpi_event.device_class.as_str() {
+            "gpe" => {
+                acpi_event_gpe_class(
+                    acpi_event.data,
+                    acpi_event._type,
+                    gpe0,
+                    sci_evt,
+                    ignored_gpe,
+                );
+            }
+            "button/power" => acpi_event_pwrbtn_class(acpi_event, pm1, sci_evt),
+            c => warn!("unknown acpi event {}", c),
+        };
+    }
+}
+
+impl Drop for ACPIPMResource {
+    fn drop(&mut self) {
+        if let Some(kill_evt) = self.kill_evt.take() {
+            let _ = kill_evt.write(1);
+        }
+
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let _ = worker_thread.join();
+        }
+    }
+}
+
+impl Pm1Resource {
+    fn trigger_sci(&self, sci_evt: &Event) {
+        if self.status
+            & self.enable
             & (BITMASK_PM1EN_GBL_EN
                 | BITMASK_PM1EN_PWRBTN_EN
                 | BITMASK_PM1EN_SLPBTN_EN
                 | BITMASK_PM1EN_RTC_EN)
             != 0
         {
-            if let Err(e) = self.sci_evt.write(1) {
-                error!("ACPIPM: failed to trigger sci event: {}", e);
+            if let Err(e) = sci_evt.write(1) {
+                error!("ACPIPM: failed to trigger sci event for pm1: {}", e);
+            }
+        }
+    }
+}
+
+impl GpeResource {
+    fn trigger_sci(&self, sci_evt: &Event) {
+        if (0..self.status.len()).any(|i| self.status[i] & self.enable[i] != 0) {
+            if let Err(e) = sci_evt.write(1) {
+                error!("ACPIPM: failed to trigger sci event for gpe: {}", e);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "direct")]
+impl DirectGpe {
+    fn new(gpe: u32) -> DirectGpe {
+        DirectGpe {
+            num: gpe,
+            path: PathBuf::from("/sys/firmware/acpi/interrupts").join(format!("gpe{:02X}", gpe)),
+            ready: false,
+            enabled: false,
+        }
+    }
+
+    fn is_status_set(&self) -> Result<bool, IoError> {
+        match fs::read_to_string(&self.path) {
+            Err(e) => {
+                error!("ACPIPM: failed to read gpe {} STS: {}", self.num, e);
+                Err(e)
+            }
+            Ok(s) => Ok(s.split_whitespace().any(|s| s == "STS")),
+        }
+    }
+
+    fn is_enabled(&self) -> Result<bool, IoError> {
+        match fs::read_to_string(&self.path) {
+            Err(e) => {
+                error!("ACPIPM: failed to read gpe {} EN: {}", self.num, e);
+                Err(e)
+            }
+            Ok(s) => Ok(s.split_whitespace().any(|s| s == "EN")),
+        }
+    }
+
+    fn clear(&self) {
+        if !self.is_status_set().unwrap_or(false) {
+            // Just to avoid harmless error messages due to clearing an already cleared GPE.
+            return;
+        }
+
+        if let Err(e) = fs::write(&self.path, "clear\n") {
+            error!("ACPIPM: failed to clear gpe {}: {}", self.num, e);
+        }
+    }
+
+    fn enable(&mut self) {
+        if self.enabled {
+            // Just to avoid harmless error messages due to enabling an already enabled GPE.
+            return;
+        }
+
+        if !self.ready {
+            // The GPE is being enabled for the first time.
+            // Use "enable" to ensure the ACPICA's reference count for this GPE is > 0.
+            match fs::write(&self.path, "enable\n") {
+                Err(e) => error!("ACPIPM: failed to enable gpe {}: {}", self.num, e),
+                Ok(()) => {
+                    self.ready = true;
+                    self.enabled = true;
+                }
+            }
+        } else {
+            // Use "unmask" instead of "enable", to bypass ACPICA's reference counting.
+            match fs::write(&self.path, "unmask\n") {
+                Err(e) => error!("ACPIPM: failed to unmask gpe {}: {}", self.num, e),
+                Ok(()) => {
+                    self.enabled = true;
+                }
             }
         }
     }
 
-    fn gpe_sci(&self) {
-        for i in 0..self.gpe0_status.len() {
-            if self.gpe0_status[i] & self.gpe0_enable[i] != 0 {
-                if let Err(e) = self.sci_evt.write(1) {
-                    error!("ACPIPM: failed to trigger sci event: {}", e);
-                }
-                return;
+    fn disable(&mut self) {
+        if !self.enabled {
+            // Just to avoid harmless error messages due to disabling an already disabled GPE.
+            return;
+        }
+
+        // Use "mask" instead of "disable", to bypass ACPICA's reference counting.
+        match fs::write(&self.path, "mask\n") {
+            Err(e) => error!("ACPIPM: failed to mask gpe {}: {}", self.num, e),
+            Ok(()) => {
+                self.enabled = false;
             }
         }
     }
@@ -131,18 +541,22 @@ const SLEEP_TYPE_S5: u16 = 0 << 10;
 
 impl PmResource for ACPIPMResource {
     fn pwrbtn_evt(&mut self) {
-        self.pm1_status |= BITMASK_PM1STS_PWRBTN_STS;
-        self.pm_sci();
+        let mut pm1 = self.pm1.lock();
+
+        pm1.status |= BITMASK_PM1STS_PWRBTN_STS;
+        pm1.trigger_sci(&self.sci_evt);
     }
 
     fn gpe_evt(&mut self, gpe: u32) {
+        let mut gpe0 = self.gpe0.lock();
+
         let byte = gpe as usize / 8;
-        if byte >= self.gpe0_status.len() {
+        if byte >= gpe0.status.len() {
             error!("gpe_evt: GPE register {} does not exist", byte);
             return;
         }
-        self.gpe0_status[byte] |= 1 << (gpe % 8);
-        self.gpe_sci();
+        gpe0.status[byte] |= 1 << (gpe % 8);
+        gpe0.trigger_sci(&self.sci_evt);
     }
 }
 
@@ -168,7 +582,9 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_STATUS as u64) as usize;
-                data.copy_from_slice(&self.pm1_status.to_ne_bytes()[offset..offset + data.len()]);
+                data.copy_from_slice(
+                    &self.pm1.lock().status.to_ne_bytes()[offset..offset + data.len()],
+                );
             }
             PM1_ENABLE..=PM1_ENABLE_LAST => {
                 if data.len() > std::mem::size_of::<u16>()
@@ -178,7 +594,9 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_ENABLE as u64) as usize;
-                data.copy_from_slice(&self.pm1_enable.to_ne_bytes()[offset..offset + data.len()]);
+                data.copy_from_slice(
+                    &self.pm1.lock().enable.to_ne_bytes()[offset..offset + data.len()],
+                );
             }
             PM1_CONTROL..=PM1_CONTROL_LAST => {
                 if data.len() > std::mem::size_of::<u16>()
@@ -188,7 +606,9 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_CONTROL as u64) as usize;
-                data.copy_from_slice(&self.pm1_control.to_ne_bytes()[offset..offset + data.len()]);
+                data.copy_from_slice(
+                    &self.pm1.lock().control.to_ne_bytes()[offset..offset + data.len()],
+                );
             }
             // OSPM accesses GPE registers through byte accesses (regardless of their length)
             GPE0_STATUS..=GPE0_STATUS_LAST => {
@@ -198,7 +618,20 @@ impl BusDevice for ACPIPMResource {
                     warn!("ACPIPM: bad read size: {}", data.len());
                     return;
                 }
-                data[0] = self.gpe0_status[(info.offset - GPE0_STATUS as u64) as usize];
+                let offset = (info.offset - GPE0_STATUS as u64) as usize;
+                data[0] = self.gpe0.lock().status[offset];
+
+                #[cfg(feature = "direct")]
+                for gpe in self
+                    .direct_gpe
+                    .iter()
+                    .filter(|gpe| gpe.num / 8 == offset as u32)
+                {
+                    data[0] &= !(1 << (gpe.num % 8));
+                    if gpe.is_status_set().unwrap_or(false) {
+                        data[0] |= 1 << (gpe.num % 8);
+                    }
+                }
             }
             GPE0_ENABLE..=GPE0_ENABLE_LAST => {
                 if data.len() > std::mem::size_of::<u8>()
@@ -207,7 +640,20 @@ impl BusDevice for ACPIPMResource {
                     warn!("ACPIPM: bad read size: {}", data.len());
                     return;
                 }
-                data[0] = self.gpe0_enable[(info.offset - GPE0_ENABLE as u64) as usize];
+                let offset = (info.offset - GPE0_ENABLE as u64) as usize;
+                data[0] = self.gpe0.lock().enable[offset];
+
+                #[cfg(feature = "direct")]
+                for gpe in self
+                    .direct_gpe
+                    .iter()
+                    .filter(|gpe| gpe.num / 8 == offset as u32)
+                {
+                    data[0] &= !(1 << (gpe.num % 8));
+                    if gpe.is_enabled().unwrap_or(false) {
+                        data[0] |= 1 << (gpe.num % 8);
+                    }
+                }
             }
             _ => {
                 warn!("ACPIPM: Bad read from {}", info);
@@ -226,11 +672,13 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_STATUS as u64) as usize;
-                let mut v = self.pm1_status.to_ne_bytes();
+
+                let mut pm1 = self.pm1.lock();
+                let mut v = pm1.status.to_ne_bytes();
                 for (i, j) in (offset..offset + data.len()).enumerate() {
                     v[j] &= !data[i];
                 }
-                self.pm1_status = u16::from_ne_bytes(v);
+                pm1.status = u16::from_ne_bytes(v);
             }
             PM1_ENABLE..=PM1_ENABLE_LAST => {
                 if data.len() > std::mem::size_of::<u16>()
@@ -240,12 +688,14 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_ENABLE as u64) as usize;
-                let mut v = self.pm1_enable.to_ne_bytes();
+
+                let mut pm1 = self.pm1.lock();
+                let mut v = pm1.enable.to_ne_bytes();
                 for (i, j) in (offset..offset + data.len()).enumerate() {
                     v[j] = data[i];
                 }
-                self.pm1_enable = u16::from_ne_bytes(v);
-                self.pm_sci(); // TODO take care of spurious interrupts
+                pm1.enable = u16::from_ne_bytes(v);
+                pm1.trigger_sci(&self.sci_evt);
             }
             PM1_CONTROL..=PM1_CONTROL_LAST => {
                 if data.len() > std::mem::size_of::<u16>()
@@ -255,7 +705,10 @@ impl BusDevice for ACPIPMResource {
                     return;
                 }
                 let offset = (info.offset - PM1_CONTROL as u64) as usize;
-                let mut v = self.pm1_control.to_ne_bytes();
+
+                let mut pm1 = self.pm1.lock();
+
+                let mut v = pm1.control.to_ne_bytes();
                 for (i, j) in (offset..offset + data.len()).enumerate() {
                     v[j] = data[i];
                 }
@@ -286,7 +739,7 @@ impl BusDevice for ACPIPMResource {
                         ),
                     }
                 }
-                self.pm1_control = val & !BITMASK_PM1CNT_SLEEP_ENABLE;
+                pm1.control = val & !BITMASK_PM1CNT_SLEEP_ENABLE;
             }
             // OSPM accesses GPE registers through byte accesses (regardless of their length)
             GPE0_STATUS..=GPE0_STATUS_LAST => {
@@ -296,7 +749,20 @@ impl BusDevice for ACPIPMResource {
                     warn!("ACPIPM: bad write size: {}", data.len());
                     return;
                 }
-                self.gpe0_status[(info.offset - GPE0_STATUS as u64) as usize] &= !data[0];
+                let offset = (info.offset - GPE0_STATUS as u64) as usize;
+
+                #[cfg(feature = "direct")]
+                for gpe in self
+                    .direct_gpe
+                    .iter()
+                    .filter(|gpe| gpe.num / 8 == offset as u32)
+                {
+                    if data[0] & (1 << (gpe.num % 8)) != 0 {
+                        gpe.clear();
+                    }
+                }
+
+                self.gpe0.lock().status[offset] &= !data[0];
             }
             GPE0_ENABLE..=GPE0_ENABLE_LAST => {
                 if data.len() > std::mem::size_of::<u8>()
@@ -305,8 +771,24 @@ impl BusDevice for ACPIPMResource {
                     warn!("ACPIPM: bad write size: {}", data.len());
                     return;
                 }
-                self.gpe0_enable[(info.offset - GPE0_ENABLE as u64) as usize] = data[0];
-                self.gpe_sci();
+                let offset = (info.offset - GPE0_ENABLE as u64) as usize;
+
+                #[cfg(feature = "direct")]
+                for gpe in self
+                    .direct_gpe
+                    .iter_mut()
+                    .filter(|gpe| gpe.num / 8 == offset as u32)
+                {
+                    if data[0] & (1 << (gpe.num % 8)) != 0 {
+                        gpe.enable();
+                    } else {
+                        gpe.disable();
+                    }
+                }
+
+                let mut gpe = self.gpe0.lock();
+                gpe.enable[offset] = data[0];
+                gpe.trigger_sci(&self.sci_evt);
             }
             _ => {
                 warn!("ACPIPM: Bad write to {}", info);
@@ -317,7 +799,7 @@ impl BusDevice for ACPIPMResource {
 
 impl BusResumeDevice for ACPIPMResource {
     fn resume_imminent(&mut self) {
-        self.pm1_status |= BITMASK_PM1CNT_WAKE_STATUS;
+        self.pm1.lock().status |= BITMASK_PM1CNT_WAKE_STATUS;
     }
 }
 

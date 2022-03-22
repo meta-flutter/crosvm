@@ -2,20 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::io::{self, IoSlice};
-use std::marker::PhantomData;
-use std::ops::Deref;
-use std::os::unix::prelude::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::{
+    io::{
+        IoSlice, {self},
+    },
+    marker::PhantomData,
+    os::unix::prelude::{AsRawFd, RawFd},
+    time::Duration,
+};
 
 use crate::{FromRawDescriptor, SafeDescriptor, ScmSocket, UnixSeqpacket, UnsyncMarker};
 
-use cros_async::{Executor, IntoAsync, IoSourceExt};
-use remain::sorted;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sys_util::{
+use crate::unix::{
     deserialize_with_descriptors, AsRawDescriptor, RawDescriptor, SerializeDescriptors,
 };
+use remain::sorted;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 #[sorted]
@@ -23,8 +25,6 @@ use thiserror::Error as ThisError;
 pub enum Error {
     #[error("failed to clone UnixSeqpacket: {0}")]
     Clone(io::Error),
-    #[error("failed to create async tube: {0}")]
-    CreateAsync(cros_async::AsyncError),
     #[error("tube was disconnected")]
     Disconnected,
     #[error("failed to serialize/deserialize json from packet: {0}")]
@@ -34,7 +34,7 @@ pub enum Error {
     #[error("failed to receive packet: {0}")]
     Recv(io::Error),
     #[error("failed to send packet: {0}")]
-    Send(sys_util::Error),
+    Send(crate::unix::Error),
     #[error("failed to set recv timeout: {0}")]
     SetRecvTimeout(io::Error),
     #[error("failed to set send timeout: {0}")]
@@ -66,11 +66,6 @@ impl Tube {
             socket,
             _unsync_marker: PhantomData,
         }
-    }
-
-    pub fn into_async_tube(self, ex: &Executor) -> Result<AsyncTube> {
-        let inner = ex.async_from(self).map_err(Error::CreateAsync)?;
-        Ok(AsyncTube { inner })
     }
 
     pub fn try_clone(&self) -> Result<Self> {
@@ -147,40 +142,12 @@ impl AsRawFd for Tube {
     }
 }
 
-impl IntoAsync for Tube {}
-
-pub struct AsyncTube {
-    inner: Box<dyn IoSourceExt<Tube>>,
-}
-
-impl AsyncTube {
-    pub async fn next<T: DeserializeOwned>(&self) -> Result<T> {
-        self.inner.wait_readable().await.unwrap();
-        self.inner.as_source().recv()
-    }
-}
-
-impl Deref for AsyncTube {
-    type Target = Tube;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_source()
-    }
-}
-
-impl From<AsyncTube> for Tube {
-    fn from(at: AsyncTube) -> Tube {
-        at.inner.into_source()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Event;
 
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use serde::{Deserialize, Serialize};
 

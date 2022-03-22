@@ -102,6 +102,9 @@ pub enum Error {
     CreateEvent(base::Error),
     #[error("failed to create fdt: {0}")]
     CreateFdt(arch::fdt::Error),
+    #[cfg(feature = "direct")]
+    #[error("failed to enable GPE forwarding: {0}")]
+    CreateGpe(devices::DirectIrqError),
     #[error("failed to create IOAPIC device: {0}")]
     CreateIoapicDevice(base::Error),
     #[error("failed to create a PCI root hub: {0}")]
@@ -196,8 +199,18 @@ const GB: u64 = 1 << 30;
 
 const BOOT_STACK_POINTER: u64 = 0x8000;
 // Make sure it align to 256MB for MTRR convenient
-const MEM_32BIT_GAP_SIZE: u64 = 1024 * MB;
-const START_OF_RAM_32BITS: u64 = 0;
+const MEM_32BIT_GAP_SIZE: u64 = if cfg!(feature = "direct") {
+    // Allow space for identity mapping coreboot memory regions on the host
+    // which is found at around 7a00_0000 (little bit before 2GB)
+    //
+    // TODO(b/188011323): stop hardcoding sizes and addresses here and instead
+    // determine the memory map from how the VM has been configured via the
+    // command line.
+    2560 * MB
+} else {
+    768 * MB
+};
+const START_OF_RAM_32BITS: u64 = if cfg!(feature = "direct") { 0x1000 } else { 0 };
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 // Reserved memory for nand_bios/LAPIC/IOAPIC/HPET/.....
 const RESERVED_MEM_SIZE: u64 = 0x800_0000;
@@ -536,6 +549,8 @@ impl arch::LinuxArch for X8664arch {
             suspend_evt.try_clone().map_err(Error::CloneEvent)?,
             exit_evt.try_clone().map_err(Error::CloneEvent)?,
             components.acpi_sdts,
+            #[cfg(feature = "direct")]
+            &components.direct_gpe,
             irq_chip.as_irq_chip_mut(),
             sci_irq,
             battery,
@@ -1268,6 +1283,7 @@ impl X8664arch {
         suspend_evt: Event,
         exit_evt: Event,
         sdts: Vec<SDT>,
+        #[cfg(feature = "direct")] direct_gpe: &[u32],
         irq_chip: &mut dyn IrqChip,
         sci_irq: u32,
         battery: (&Option<BatteryType>, Option<Minijail>),
@@ -1299,9 +1315,45 @@ impl X8664arch {
         irq_chip
             .register_irq_event(sci_irq, &pm_sci_evt, Some(&pm_sci_evt_resample))
             .map_err(Error::RegisterIrqfd)?;
-        let pmresource =
-            devices::ACPIPMResource::new(pm_sci_evt, pm_sci_evt_resample, suspend_evt, exit_evt);
+
+        #[cfg(feature = "direct")]
+        let direct_gpe_info = if direct_gpe.is_empty() {
+            None
+        } else {
+            let direct_sci_evt = Event::new().map_err(Error::CreateEvent)?;
+            let direct_sci_evt_resample = Event::new().map_err(Error::CreateEvent)?;
+
+            let mut sci_devirq = devices::DirectIrq::new(
+                direct_sci_evt.try_clone().map_err(Error::CloneEvent)?,
+                Some(
+                    direct_sci_evt_resample
+                        .try_clone()
+                        .map_err(Error::CloneEvent)?,
+                ),
+            )
+            .map_err(Error::CreateGpe)?;
+
+            sci_devirq.sci_irq_prepare().map_err(Error::CreateGpe)?;
+
+            for gpe in direct_gpe {
+                sci_devirq
+                    .gpe_enable_forwarding(*gpe)
+                    .map_err(Error::CreateGpe)?;
+            }
+
+            Some((direct_sci_evt, direct_sci_evt_resample, direct_gpe))
+        };
+
+        let mut pmresource = devices::ACPIPMResource::new(
+            pm_sci_evt,
+            pm_sci_evt_resample,
+            #[cfg(feature = "direct")]
+            direct_gpe_info,
+            suspend_evt,
+            exit_evt,
+        );
         pmresource.to_aml_bytes(&mut amls);
+        pmresource.start();
 
         let mut crs_entries: Vec<Box<dyn Aml>> = vec![
             Box::new(aml::AddressSpace::new_bus_number(0x0u16, max_bus as u16)),

@@ -45,6 +45,7 @@ members = [
     "arch",
     "base",
     "bit_field",
+    "cros_async",
     "crosvm-fuzz",
     "crosvm_control",
     "crosvm_plugin",
@@ -54,6 +55,7 @@ members = [
     "gpu_display",
     "hypervisor",
     "integration_tests",
+    "io_uring",
     "kernel_cmdline",
     "kernel_loader",
     "kvm",
@@ -115,7 +117,7 @@ chromeos = ["base/chromeos", "audio_cras", "devices/chromeos"]
 composite-disk = ["protos/composite-disk", "protobuf", "disk/composite-disk"]
 default = ["audio", "gpu", "usb"]
 default-no-sandbox = []
-direct = ["devices/direct", "x86_64/direct"]
+direct = ["devices/direct", "arch/direct", "x86_64/direct"]
 gdb = ["gdbstub", "gdbstub_arch", "arch/gdb", "vm_control/gdb", "x86_64/gdb"]
 gfxstream = ["devices/gfxstream"]
 gpu = ["devices/gpu"]
@@ -192,7 +194,7 @@ assertions = { path = "common/assertions" }
 audio_streams = { path = "common/audio_streams" }
 base = { path = "base" }
 sys_util_core = { path = "common/sys_util_core" }
-cros_async =  { path = "common/cros_async" }
+cros_async =  { path = "cros_async" }
 cros_fuzz = { path = "common/cros-fuzz" } # ignored by ebuild
 data_model = { path = "common/data_model" }
 libcras = { path = "libcras_stub" } # ignored by ebuild

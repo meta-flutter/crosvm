@@ -2,11 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{
-    AsRawDescriptor, FakeClock, FromRawDescriptor, IntoRawDescriptor, RawDescriptor, Result,
-};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor};
+use crate::{FakeClock, RawDescriptor, Result};
 
-use crate::unix::{FakeTimerFd, TimerFd};
+use crate::platform::{FakeTimerFd, TimerFd};
 use std::{
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     sync::Arc,
@@ -14,7 +13,7 @@ use std::{
 };
 use sync::Mutex;
 
-/// See [TimerFd](crate::unix::TimerFd) for struct- and method-level
+/// See [TimerFd](crate::platform::TimerFd) for struct- and method-level
 /// documentation.
 pub struct Timer(pub TimerFd);
 impl Timer {
@@ -23,7 +22,7 @@ impl Timer {
     }
 }
 
-/// See [FakeTimerFd](crate::unix::FakeTimerFd) for struct- and method-level
+/// See [FakeTimerFd](crate::platform::FakeTimerFd) for struct- and method-level
 /// documentation.
 pub struct FakeTimer(FakeTimerFd);
 impl FakeTimer {

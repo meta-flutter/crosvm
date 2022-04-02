@@ -2,10 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{
-    AsRawDescriptor, Error, FromRawDescriptor, IntoRawDescriptor, MemfdSeals, RawDescriptor,
-    Result, SafeDescriptor,
-};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor};
+use crate::{Error, MemfdSeals, RawDescriptor, Result};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::{
@@ -14,10 +12,10 @@ use std::{
     os::unix::io::{AsRawFd, IntoRawFd},
 };
 
-use crate::unix::SharedMemory as SysUtilSharedMemory;
+use crate::platform::SharedMemory as SysUtilSharedMemory;
 use serde::{Deserialize, Serialize};
 
-/// See [SharedMemory](crate::unix::SharedMemory) for struct- and method-level
+/// See [SharedMemory](crate::platform::SharedMemory) for struct- and method-level
 /// documentation.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]

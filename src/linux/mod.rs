@@ -14,7 +14,7 @@ use std::ops::RangeInclusive;
 #[cfg(feature = "gpu")]
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use std::process;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use std::thread;
 
+use devices::virtio::vhost::vsock::{VhostVsockConfig, VhostVsockDeviceParameter};
 use libc;
 
 use acpi_tables::sdt::SDT;
@@ -38,8 +39,7 @@ use devices::virtio::{self, EventDevice};
 use devices::Ac97Dev;
 use devices::{
     self, BusDeviceObj, HostHotPlugKey, HotPlugBus, IrqEventIndex, KvmKernelIrqChip, PciAddress,
-    PciBridge, PciDevice, PcieHostRootPort, PcieRootPort, PvPanicCode, PvPanicPciDevice,
-    StubPciDevice, VirtioPciDevice,
+    PciDevice, PvPanicCode, PvPanicPciDevice, StubPciDevice, VirtioPciDevice,
 };
 use devices::{CoIommuDev, IommuDevType};
 #[cfg(feature = "usb")]
@@ -60,17 +60,20 @@ use arch::{
     self, LinuxArch, RunnableLinuxVm, VcpuAffinity, VirtioDeviceStub, VmComponents, VmImage,
 };
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use {
+    crate::HostPcieRootPortParameters,
+    devices::{
+        IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip, PciBridge, PcieHostRootPort, PcieRootPort,
+    },
+    hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
+    x86_64::X8664arch as Arch,
+};
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
     aarch64::AArch64 as Arch,
     devices::IrqChipAArch64 as IrqChipArch,
     hypervisor::{VcpuAArch64 as VcpuArch, VmAArch64 as VmArch},
-};
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use {
-    devices::{IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip},
-    hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
-    x86_64::X8664arch as Arch,
 };
 
 mod device_helpers;
@@ -201,7 +204,7 @@ fn create_virtio_devices(
                 .context("failed to set up mouse device")?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(cfg, "input_device")?,
+                    jail: simple_jail(&cfg.jail_config, "input_device")?,
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
             }
@@ -218,7 +221,7 @@ fn create_virtio_devices(
                 .context("failed to set up keyboard device")?;
                 devs.push(VirtioDeviceStub {
                     dev: Box::new(dev),
-                    jail: simple_jail(cfg, "input_device")?,
+                    jail: simple_jail(&cfg.jail_config, "input_device")?,
                 });
                 event_devices.push(EventDevice::keyboard(event_device_socket));
             }
@@ -279,7 +282,7 @@ fn create_virtio_devices(
     #[cfg(feature = "tpm")]
     {
         if cfg.software_tpm {
-            devs.push(create_tpm_device(cfg)?);
+            devs.push(create_software_tpm_device(cfg)?);
         }
     }
 
@@ -397,7 +400,14 @@ fn create_virtio_devices(
     }
 
     if let Some(cid) = cfg.cid {
-        devs.push(create_vhost_vsock_device(cfg, cid)?);
+        let vhost_config = VhostVsockConfig {
+            device: cfg
+                .vhost_vsock_device
+                .clone()
+                .unwrap_or(VhostVsockDeviceParameter::default()),
+            cid,
+        };
+        devs.push(create_vhost_vsock_device(cfg, &vhost_config)?);
     }
 
     for vhost_user_fs in &cfg.vhost_user_fs {
@@ -485,6 +495,7 @@ fn create_devices(
                 control_tubes,
                 vfio_path.as_path(),
                 None,
+                vfio_dev.guest_address(),
                 iommu_attached_endpoints,
                 Some(&mut coiommu_attached_endpoints),
                 vfio_dev.iommu_dev_type(),
@@ -558,7 +569,7 @@ fn create_devices(
             )
             .context("failed to create coiommu device")?;
 
-            devices.push((Box::new(dev), simple_jail(cfg, "coiommu")?));
+            devices.push((Box::new(dev), simple_jail(&cfg.jail_config, "coiommu")?));
         }
     }
 
@@ -595,7 +606,7 @@ fn create_devices(
     for ac97_param in &cfg.ac97_parameters {
         let dev = Ac97Dev::try_new(vm.get_memory().clone(), ac97_param.clone())
             .context("failed to create ac97 device")?;
-        let jail = simple_jail(cfg, dev.minijail_policy())?;
+        let jail = simple_jail(&cfg.jail_config, dev.minijail_policy())?;
         devices.push((Box::new(dev), jail));
     }
 
@@ -603,7 +614,7 @@ fn create_devices(
     if cfg.usb {
         // Create xhci controller.
         let usb_controller = Box::new(XhciController::new(vm.get_memory().clone(), usb_provider));
-        devices.push((usb_controller, simple_jail(cfg, "xhci")?));
+        devices.push((usb_controller, simple_jail(&cfg.jail_config, "xhci")?));
     }
 
     for params in &cfg.stub_pci_devices {
@@ -669,13 +680,15 @@ fn create_file_backed_mappings(
     Ok(())
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn create_pcie_root_port(
-    host_pcie_rp: Vec<PathBuf>,
+    host_pcie_rp: Vec<HostPcieRootPortParameters>,
     sys_allocator: &mut SystemAllocator,
     control_tubes: &mut Vec<TaggedControlTube>,
     devices: &mut Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
     hp_vec: &mut Vec<Arc<Mutex<dyn HotPlugBus>>>,
     hp_endpoints_ranges: &mut Vec<RangeInclusive<u32>>,
+    gpe_notify_devs: &mut Vec<(u32, Arc<Mutex<dyn GpeNotify>>)>,
 ) -> Result<()> {
     if host_pcie_rp.is_empty() {
         // user doesn't specify host pcie root port which link to this virtual pcie rp,
@@ -727,8 +740,9 @@ fn create_pcie_root_port(
     } else {
         // user specify host pcie root port which link to this virtual pcie rp,
         // reserve the host pci BDF and create a virtual pcie RP with some attrs same as host
-        for pcie_sysfs in host_pcie_rp.iter() {
-            let pcie_host = PcieHostRootPort::new(pcie_sysfs.as_path())?;
+        for host_pcie in host_pcie_rp.iter() {
+            let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
+            let pcie_host = PcieHostRootPort::new(host_pcie.host_path.as_path(), vm_device_tube)?;
             let bus_range = pcie_host.get_bus_range();
             let mut slot_implemented = true;
             for i in bus_range.secondary..=bus_range.subordinate {
@@ -738,12 +752,15 @@ fn create_pcie_root_port(
                 // hotplug capability and won't use slot.
                 if !sys_allocator.pci_bus_empty(i) {
                     slot_implemented = false;
+                    break;
                 }
             }
+
             let pcie_root_port = Arc::new(Mutex::new(PcieRootPort::new_from_host(
                 pcie_host,
                 slot_implemented,
             )?));
+            control_tubes.push(TaggedControlTube::Vm(vm_host_tube));
 
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
             control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
@@ -757,23 +774,32 @@ fn create_pcie_root_port(
                 );
             }
 
-            hp_endpoints_ranges.push(RangeInclusive::new(
-                PciAddress {
-                    bus: pci_bridge.get_secondary_num(),
-                    dev: 0,
-                    func: 0,
-                }
-                .to_u32(),
-                PciAddress {
-                    bus: pci_bridge.get_subordinate_num(),
-                    dev: 32,
-                    func: 8,
-                }
-                .to_u32(),
-            ));
+            // Only append the sub pci range of a hot-pluggable root port to virtio-iommu
+            if slot_implemented {
+                hp_endpoints_ranges.push(RangeInclusive::new(
+                    PciAddress {
+                        bus: pci_bridge.get_secondary_num(),
+                        dev: 0,
+                        func: 0,
+                    }
+                    .to_u32(),
+                    PciAddress {
+                        bus: pci_bridge.get_subordinate_num(),
+                        dev: 32,
+                        func: 8,
+                    }
+                    .to_u32(),
+                ));
+            }
 
             devices.push((pci_bridge, None));
-            hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
+            if slot_implemented {
+                if let Some(gpe) = host_pcie.hp_gpe {
+                    gpe_notify_devs
+                        .push((gpe, pcie_root_port.clone() as Arc<Mutex<dyn GpeNotify>>));
+                }
+                hp_vec.push(pcie_root_port as Arc<Mutex<dyn HotPlugBus>>);
+            }
         }
     }
 
@@ -783,12 +809,8 @@ fn create_pcie_root_port(
 fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     let initrd_image = if let Some(initrd_path) = &cfg.initrd_path {
         Some(
-            open_file(
-                initrd_path,
-                true,  /*read_only*/
-                false, /*O_DIRECT*/
-            )
-            .with_context(|| format!("failed to open initrd {}", initrd_path.display()))?,
+            open_file(initrd_path, OpenOptions::new().read(true))
+                .with_context(|| format!("failed to open initrd {}", initrd_path.display()))?,
         )
     } else {
         None
@@ -796,15 +818,12 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
 
     let vm_image = match cfg.executable_path {
         Some(Executable::Kernel(ref kernel_path)) => VmImage::Kernel(
-            open_file(
-                kernel_path,
-                true,  /*read_only*/
-                false, /*O_DIRECT*/
-            )
-            .with_context(|| format!("failed to open kernel image {}", kernel_path.display()))?,
+            open_file(kernel_path, OpenOptions::new().read(true)).with_context(|| {
+                format!("failed to open kernel image {}", kernel_path.display())
+            })?,
         ),
         Some(Executable::Bios(ref bios_path)) => VmImage::Bios(
-            open_file(bios_path, true /*read_only*/, false /*O_DIRECT*/)
+            open_file(bios_path, OpenOptions::new().read(true))
                 .with_context(|| format!("failed to open bios {}", bios_path.display()))?,
         ),
         _ => panic!("Did not receive a bios or kernel, should be impossible."),
@@ -1002,7 +1021,7 @@ where
     Vcpu: VcpuArch + 'static,
     V: VmArch + 'static,
 {
-    if cfg.sandbox {
+    if cfg.jail_config.is_some() {
         // Printing something to the syslog before entering minijail so that libc's syslogger has a
         // chance to open files necessary for its operation, like `/etc/localtime`. After jailing,
         // access to those files will not be possible.
@@ -1103,7 +1122,7 @@ where
 
     let battery = if cfg.battery_type.is_some() {
         #[cfg_attr(not(feature = "power-monitor-powerd"), allow(clippy::manual_map))]
-        let jail = match simple_jail(&cfg, "battery")? {
+        let jail = match simple_jail(&cfg.jail_config, "battery")? {
             #[cfg_attr(not(feature = "power-monitor-powerd"), allow(unused_mut))]
             Some(mut jail) => {
                 // Setup a bind mount to the system D-Bus socket if the powerd monitor is used.
@@ -1261,14 +1280,16 @@ where
     )?;
 
     let mut hp_endpoints_ranges: Vec<RangeInclusive<u32>> = Vec::new();
-
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let mut hotplug_buses: Vec<Arc<Mutex<dyn HotPlugBus>>> = Vec::new();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let mut gpe_notify_devs: Vec<(u32, Arc<Mutex<dyn GpeNotify>>)> = Vec::new();
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         #[cfg(feature = "direct")]
         let rp_host = cfg.pcie_rp.clone();
         #[cfg(not(feature = "direct"))]
-        let rp_host: Vec<PathBuf> = Vec::new();
+        let rp_host: Vec<HostPcieRootPortParameters> = Vec::new();
 
         // Create Pcie Root Port
         create_pcie_root_port(
@@ -1278,6 +1299,7 @@ where
             &mut devices,
             &mut hotplug_buses,
             &mut hp_endpoints_ranges,
+            &mut gpe_notify_devs,
         )?;
     }
 
@@ -1338,7 +1360,7 @@ where
         &reset_evt,
         &mut sys_allocator,
         &cfg.serial_parameters,
-        simple_jail(&cfg, "serial")?,
+        simple_jail(&cfg.jail_config, "serial")?,
         battery,
         vm,
         ramoops_region,
@@ -1352,6 +1374,12 @@ where
     {
         for hotplug_bus in hotplug_buses.iter() {
             linux.hotplug_bus.push(hotplug_bus.clone());
+        }
+
+        if let Some(pm) = &linux.pm {
+            while let Some((gpe, notify_dev)) = gpe_notify_devs.pop() {
+                pm.lock().register_gpe_notify_dev(gpe, notify_dev);
+            }
         }
     }
 
@@ -1445,6 +1473,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
         control_tubes,
         vfio_path,
         Some(bus_num),
+        None,
         &mut endpoints,
         None,
         if iommu_host_tube.is_some() {
@@ -1634,7 +1663,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             .context("failed to add descriptor to wait context")?;
     }
 
-    if cfg.sandbox {
+    if cfg.jail_config.is_some() {
         // Before starting VCPUs, in case we started with some capabilities, drop them all.
         drop_capabilities().context("failed to drop process capabilities")?;
     }
@@ -2109,6 +2138,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // Create a file-backed mapping parameters struct with the given `address` and `size` and other
     // parameters set to default values.

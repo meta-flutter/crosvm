@@ -4,9 +4,10 @@
 
 use std::{os::unix::io::AsRawFd, time::Duration};
 
+use crate::descriptor::AsRawDescriptor;
 use crate::{
-    unix::{PollContext, PollToken, WatchingEvents},
-    wrap_descriptor, AsRawDescriptor, RawDescriptor, Result,
+    platform::{PollContext, PollToken, WatchingEvents},
+    wrap_descriptor, RawDescriptor, Result,
 };
 use smallvec::SmallVec;
 

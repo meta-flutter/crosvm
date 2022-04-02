@@ -22,7 +22,8 @@ use base::{
 use data_model::{DataInit, Le32};
 use libc::{recv, MSG_DONTWAIT, MSG_PEEK};
 use resources::Alloc;
-use vm_control::{VmMemoryRequest, VmMemoryResponse};
+use uuid::Uuid;
+use vm_control::{VmMemoryDestination, VmMemoryRequest, VmMemoryResponse, VmMemorySource};
 use vm_memory::GuestMemory;
 use vmm_vhost::{
     connection::socket::Endpoint as SocketEndpoint,
@@ -706,18 +707,18 @@ impl Worker {
         }
 
         for (region, file) in contexts.iter().zip(files.into_iter()) {
-            // TODO(abhishekbh): Figure out how to accomodate each |region|'s
-            // mmap offset. During testing it was 0 but we should probably account for it.
-            if region.mmap_offset != 0 {
-                error!("Region mmap offset is not 0");
-            }
-
-            let request = VmMemoryRequest::RegisterFdAtPciBarOffset(
-                self.pci_bar,
-                SafeDescriptor::from(file),
-                region.memory_size as usize,
-                self.mem_offset as u64,
-            );
+            let request = VmMemoryRequest::RegisterMemory {
+                source: VmMemorySource::Descriptor {
+                    descriptor: SafeDescriptor::from(file),
+                    offset: region.mmap_offset,
+                    size: region.memory_size,
+                },
+                dest: VmMemoryDestination::ExistingAllocation {
+                    allocation: self.pci_bar,
+                    offset: self.mem_offset as u64,
+                },
+                read_only: false,
+            };
             self.process_memory_mapping_request(&request)?;
             self.mem_offset += region.memory_size as usize;
         }
@@ -993,6 +994,7 @@ impl VirtioVhostUser {
         listener: UnixListener,
         main_process_tube: Tube,
         pci_address: Option<PciAddress>,
+        uuid: Option<Uuid>,
     ) -> Result<VirtioVhostUser> {
         Ok(VirtioVhostUser {
             base_features,
@@ -1000,7 +1002,7 @@ impl VirtioVhostUser {
             config: VirtioVhostUserConfig {
                 status: Le32::from(0),
                 max_vhost_queues: Le32::from(MAX_VHOST_DEVICE_QUEUES as u32),
-                uuid: [0; CONFIG_UUID_SIZE],
+                uuid: *uuid.unwrap_or_default().as_bytes(),
             },
             kill_evt: None,
             worker_thread: None,

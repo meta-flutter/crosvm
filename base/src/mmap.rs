@@ -2,16 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use crate::descriptor::AsRawDescriptor;
 use crate::{
-    unix::MemoryMapping as SysUtilMmap, wrap_descriptor, AsRawDescriptor, MappedRegion,
-    MemoryMappingArena, MmapError, Protection, SharedMemory,
+    platform::MemoryMapping as SysUtilMmap, wrap_descriptor, MappedRegion, MemoryMappingArena,
+    MmapError, Protection, SharedMemory,
 };
 use data_model::{volatile_memory::*, DataInit};
 use std::fs::File;
 
 pub type Result<T> = std::result::Result<T, MmapError>;
 
-/// See [MemoryMapping](crate::unix::MemoryMapping) for struct- and method-level
+/// See [MemoryMapping](crate::platform::MemoryMapping) for struct- and method-level
 /// documentation.
 #[derive(Debug)]
 pub struct MemoryMapping {

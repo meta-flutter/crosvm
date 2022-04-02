@@ -27,7 +27,6 @@ mod acpi_event;
 mod capabilities;
 mod clock;
 mod descriptor;
-mod descriptor_reflection;
 mod eventfd;
 mod file_flags;
 pub mod file_traits;
@@ -52,6 +51,10 @@ mod timerfd;
 pub mod vsock;
 mod write_zeroes;
 
+pub use crate::descriptor_reflection::{
+    deserialize_with_descriptors, with_as_descriptor, with_raw_descriptor, FileSerdeWrapper,
+    SerializeDescriptors,
+};
 pub use crate::{
     common::{Error, Result, *},
     generate_scoped_event,
@@ -61,10 +64,6 @@ pub use base_poll_token_derive::*;
 pub use capabilities::drop_capabilities;
 pub use clock::{Clock, FakeClock};
 pub use descriptor::*;
-pub use descriptor_reflection::{
-    deserialize_with_descriptors, with_as_descriptor, with_raw_descriptor, FileSerdeWrapper,
-    SerializeDescriptors,
-};
 pub use eventfd::*;
 pub use file_flags::*;
 pub use fork::*;
@@ -84,6 +83,7 @@ pub use sock_ctrl_msg::*;
 pub use terminal::*;
 pub use timerfd::*;
 
+use crate::descriptor::{FromRawDescriptor, SafeDescriptor};
 pub use file_traits::{
     AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,
     FileSync,
@@ -100,7 +100,6 @@ use std::{
     mem,
     ops::Deref,
     os::unix::{
-        fs::OpenOptionsExt,
         io::{AsRawFd, FromRawFd, RawFd},
         net::{UnixDatagram, UnixListener},
     },
@@ -111,7 +110,7 @@ use std::{
 
 use libc::{
     c_int, c_long, fcntl, pipe2, syscall, sysconf, waitpid, SYS_getpid, SYS_gettid, EINVAL,
-    F_GETFL, F_SETFL, O_CLOEXEC, O_DIRECT, SIGKILL, WNOHANG, _SC_IOV_MAX, _SC_PAGESIZE,
+    F_GETFL, F_SETFL, O_CLOEXEC, SIGKILL, WNOHANG, _SC_IOV_MAX, _SC_PAGESIZE,
 };
 
 /// Re-export libc types that are part of the API.
@@ -128,7 +127,7 @@ macro_rules! syscall {
     ($e:expr) => {{
         let res = $e;
         if res < 0 {
-            $crate::unix::errno_result()
+            $crate::platform::errno_result()
         } else {
             Ok(res)
         }
@@ -358,7 +357,7 @@ pub fn wait_for_pid<A: AsRawPid>(pid: A, options: c_int) -> Result<(Option<Pid>,
 /// ```
 /// fn reap_children() {
 ///     loop {
-///         match crate::unix::reap_child() {
+///         match crate::platform::reap_child() {
 ///             Ok(0) => println!("no children ready to reap"),
 ///             Ok(pid) => {
 ///                 println!("reaped {}", pid);
@@ -606,17 +605,13 @@ pub fn safe_descriptor_from_path<P: AsRef<Path>>(path: P) -> Result<Option<SafeD
 /// Note that this will not work properly if the same `/proc/self/fd/N` path is used twice in
 /// different places, as the metadata (including the offset) will be shared between both file
 /// descriptors.
-pub fn open_file<P: AsRef<Path>>(path: P, read_only: bool, o_direct: bool) -> Result<File> {
+pub fn open_file<P: AsRef<Path>>(path: P, options: &OpenOptions) -> Result<File> {
     let path = path.as_ref();
     // Special case '/proc/self/fd/*' paths. The FD is already open, just use it.
     Ok(if let Some(fd) = safe_descriptor_from_path(path)? {
         fd.into()
     } else {
-        OpenOptions::new()
-            .custom_flags(if o_direct { O_DIRECT } else { 0 })
-            .write(!read_only)
-            .read(true)
-            .open(path)?
+        options.open(path)?
     })
 }
 

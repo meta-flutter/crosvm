@@ -12,13 +12,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::unix::EventReadResult;
-use crate::{
-    generate_scoped_event, unix::EventFd, AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor,
-    RawDescriptor, Result,
-};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor};
+pub use crate::platform::EventReadResult;
+use crate::{generate_scoped_event, platform::EventFd, RawDescriptor, Result};
 
-/// See [EventFd](crate::unix::EventFd) for struct- and method-level
+/// See [EventFd](crate::platform::EventFd) for struct- and method-level
 /// documentation.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -36,7 +34,7 @@ impl Event {
         self.0.read()
     }
 
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<EventReadResult> {
+    pub fn read_timeout(&self, timeout: Duration) -> Result<EventReadResult> {
         self.0.read_timeout(timeout)
     }
 

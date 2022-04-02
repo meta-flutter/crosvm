@@ -13,10 +13,8 @@ use std::{
 use libc::{c_void, eventfd, read, write, POLLIN};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    duration_to_timespec, errno_result, AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor,
-    RawDescriptor, Result, SafeDescriptor,
-};
+use super::{duration_to_timespec, errno_result, RawDescriptor, Result};
+use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor};
 use crate::generate_scoped_event;
 
 /// A safe wrapper around a Linux eventfd (man 2 eventfd).
@@ -93,7 +91,7 @@ impl EventFd {
     /// a timeout does not occur then the count is returned as a EventReadResult::Count(count),
     /// and the count is reset to 0. If a timeout does occur then this function will return
     /// EventReadResult::Timeout.
-    pub fn read_timeout(&mut self, timeout: Duration) -> Result<EventReadResult> {
+    pub fn read_timeout(&self, timeout: Duration) -> Result<EventReadResult> {
         let mut pfd = libc::pollfd {
             fd: self.as_raw_descriptor(),
             events: POLLIN,
@@ -218,7 +216,7 @@ mod tests {
 
     #[test]
     fn timeout() {
-        let mut evt = EventFd::new().expect("failed to create eventfd");
+        let evt = EventFd::new().expect("failed to create eventfd");
         assert_eq!(
             evt.read_timeout(Duration::from_millis(1))
                 .expect("failed to read from eventfd with timeout"),

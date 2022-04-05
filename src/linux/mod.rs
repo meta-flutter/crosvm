@@ -78,12 +78,12 @@ use {
 
 mod device_helpers;
 use device_helpers::*;
-mod jail_helpers;
+pub(crate) mod jail_helpers;
 use jail_helpers::*;
 mod vcpu;
 
 #[cfg(feature = "gpu")]
-mod gpu;
+pub(crate) mod gpu;
 #[cfg(feature = "gpu")]
 pub use gpu::GpuRenderServerParameters;
 #[cfg(feature = "gpu")]
@@ -1973,7 +1973,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         let irq_chip = &mut linux.irq_chip;
                                         request.execute(
                                             |setup| match setup {
-                                                IrqSetup::Event(irq, ev) => {
+                                                IrqSetup::Event(irq, ev, _, _, _) => {
                                                     if let Some(event_index) = irq_chip
                                                         .register_irq_event(irq, ev, None)?
                                                     {

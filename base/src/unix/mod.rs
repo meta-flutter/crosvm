@@ -30,7 +30,6 @@ mod descriptor;
 mod eventfd;
 mod file_flags;
 pub mod file_traits;
-mod fork;
 mod get_filesystem_type;
 mod mmap;
 pub mod net;
@@ -56,7 +55,7 @@ pub use crate::descriptor_reflection::{
     SerializeDescriptors,
 };
 pub use crate::{
-    common::{Error, Result, *},
+    errno::{Error, Result, *},
     generate_scoped_event,
 };
 pub use acpi_event::*;
@@ -66,7 +65,6 @@ pub use clock::{Clock, FakeClock};
 pub use descriptor::*;
 pub use eventfd::*;
 pub use file_flags::*;
-pub use fork::*;
 pub use get_filesystem_type::*;
 pub use ioctl::*;
 pub use mmap::*;

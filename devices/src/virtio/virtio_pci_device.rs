@@ -8,8 +8,8 @@ use sync::Mutex;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use acpi_tables::sdt::SDT;
-use anyhow::{bail, Context};
-use base::{error, warn, AsRawDescriptor, AsRawDescriptors, Event, RawDescriptor, Result, Tube};
+use anyhow::{anyhow, bail, Context};
+use base::{error, AsRawDescriptors, Event, RawDescriptor, Result, Tube};
 use data_model::{DataInit, Le32};
 use hypervisor::Datamatch;
 use libc::ERANGE;
@@ -23,6 +23,7 @@ use crate::pci::{
     PciDeviceError, PciDisplaySubclass, PciHeaderType, PciId, PciInterruptPin, PciSubclass,
 };
 use crate::virtio::ipc_memory_mapper::IpcMemoryMapper;
+use crate::IrqLevelEvent;
 
 use self::virtio_pci_common_config::VirtioPciCommonConfig;
 
@@ -232,8 +233,7 @@ pub struct VirtioPciDevice {
     device_activated: bool,
 
     interrupt_status: Arc<AtomicUsize>,
-    interrupt_evt: Option<Event>,
-    interrupt_resample_evt: Option<Event>,
+    interrupt_evt: Option<IrqLevelEvent>,
     queues: Vec<Queue>,
     queue_evts: Vec<Event>,
     mem: GuestMemory,
@@ -305,7 +305,6 @@ impl VirtioPciDevice {
             device_activated: false,
             interrupt_status: Arc::new(AtomicUsize::new(0)),
             interrupt_evt: None,
-            interrupt_resample_evt: None,
             queues,
             queue_evts,
             mem,
@@ -420,39 +419,18 @@ impl VirtioPciDevice {
 
     /// Activates the underlying `VirtioDevice`. `assign_irq` has to be called first.
     fn activate(&mut self) -> anyhow::Result<()> {
-        let interrupt_evt = self.interrupt_evt.take().context("interrupt_evt is none")?;
-        self.interrupt_evt = match interrupt_evt.try_clone() {
-            Ok(evt) => Some(evt),
-            Err(e) => {
-                warn!(
-                    "{} failed to clone interrupt_evt: {}",
-                    self.debug_label(),
-                    e
-                );
-                None
-            }
+        let interrupt_evt = if let Some(ref evt) = self.interrupt_evt {
+            evt.try_clone()
+                .with_context(|| format!("{} failed to clone interrupt_evt", self.debug_label()))?
+        } else {
+            return Err(anyhow!("{} interrupt_evt is none", self.debug_label()));
         };
-        let interrupt_resample_evt = self
-            .interrupt_resample_evt
-            .take()
-            .context("interrupt_resample_evt is none")?;
-        self.interrupt_resample_evt = match interrupt_resample_evt.try_clone() {
-            Ok(evt) => Some(evt),
-            Err(e) => {
-                warn!(
-                    "{} failed to clone interrupt_resample_evt: {}",
-                    self.debug_label(),
-                    e
-                );
-                None
-            }
-        };
+
         let mem = self.mem.clone();
 
         let interrupt = Interrupt::new(
             self.interrupt_status.clone(),
             interrupt_evt,
-            interrupt_resample_evt,
             Some(self.msix_config.clone()),
             self.common_config.msix_config,
         );
@@ -513,10 +491,7 @@ impl PciDevice for VirtioPciDevice {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
         let mut rds = self.device.keep_rds();
         if let Some(interrupt_evt) = &self.interrupt_evt {
-            rds.push(interrupt_evt.as_raw_descriptor());
-        }
-        if let Some(interrupt_resample_evt) = &self.interrupt_resample_evt {
-            rds.push(interrupt_resample_evt.as_raw_descriptor());
+            rds.extend(interrupt_evt.as_raw_descriptors());
         }
         let descriptor = self.msix_config.lock().get_msi_socket();
         rds.push(descriptor);
@@ -528,12 +503,10 @@ impl PciDevice for VirtioPciDevice {
 
     fn assign_irq(
         &mut self,
-        irq_evt: &Event,
-        irq_resample_evt: &Event,
+        irq_evt: &IrqLevelEvent,
         irq_num: Option<u32>,
     ) -> Option<(u32, PciInterruptPin)> {
         self.interrupt_evt = Some(irq_evt.try_clone().ok()?);
-        self.interrupt_resample_evt = Some(irq_resample_evt.try_clone().ok()?);
         let gsi = irq_num?;
         let pin = self.pci_address.map_or(
             PciInterruptPin::IntA,

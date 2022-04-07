@@ -116,6 +116,7 @@ all-linux = [
     "virgl_renderer",
     "x",
     ]
+win64 = []
 audio = ["devices/audio"]
 audio_cras = ["devices/audio_cras"]
 chromeos = ["base/chromeos", "audio_cras", "devices/chromeos"]
@@ -138,6 +139,7 @@ linux-aarch64 = ["all-linux"]
 plugin = ["protos/plugin", "crosvm_plugin", "kvm", "kvm_sys", "protobuf"]
 plugin-render-server = []
 power-monitor-powerd = ["arch/power-monitor-powerd"]
+slirp = ["devices/slirp"]
 tpm = ["devices/tpm"]
 usb = ["devices/usb"]
 video-decoder = ["devices/video-decoder"]
@@ -197,6 +199,7 @@ aarch64 = { path = "aarch64" }
 
 [dev-dependencies]
 base = "*"
+lazy_static = "*"
 
 [patch.crates-io]
 assertions = { path = "common/assertions" }

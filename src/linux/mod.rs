@@ -959,6 +959,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     guest_mem.set_memory_policy(mem_policy);
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
     let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
+
+    if !cfg.userspace_msr.is_empty() {
+        vm.enable_userspace_msr()
+            .context("failed to enable userspace MSR handling, do you have kernel 5.10 or later")?;
+    }
+
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protected_vm != ProtectionType::Unprotected && !vm.check_capability(VmCap::Protected) {
         bail!("Failed to create protected VM");
@@ -1225,12 +1231,9 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
-        let trigger = Event::new().context("failed to create event")?;
-        let resample = Event::new().context("failed to create event")?;
-        irq_chip
-            .register_irq_event(*irq, &trigger, Some(&resample))
-            .unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, Some(resample))
+        let irq_evt = devices::IrqLevelEvent::new().context("failed to create event")?;
+        irq_chip.register_level_irq_event(*irq, &irq_evt).unwrap();
+        let direct_irq = devices::DirectIrq::new_level(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
         direct_irq
             .irq_enable(*irq)
@@ -1243,9 +1246,9 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
-        let trigger = Event::new().context("failed to create event")?;
-        irq_chip.register_irq_event(*irq, &trigger, None).unwrap();
-        let direct_irq = devices::DirectIrq::new(trigger, None)
+        let irq_evt = devices::IrqEdgeEvent::new().context("failed to create event")?;
+        irq_chip.register_edge_irq_event(*irq, &irq_evt).unwrap();
+        let direct_irq = devices::DirectIrq::new_edge(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
         direct_irq
             .irq_enable(*irq)
@@ -1750,6 +1753,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         .context("failed to clone vcpu cgroup tasks file")?,
                 ),
             },
+            cfg.userspace_msr.clone(),
         )?;
         vcpu_handles.push((handle, to_vcpu_channel));
     }
@@ -1974,8 +1978,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                         request.execute(
                                             |setup| match setup {
                                                 IrqSetup::Event(irq, ev, _, _, _) => {
+                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
                                                     if let Some(event_index) = irq_chip
-                                                        .register_irq_event(irq, ev, None)?
+                                                        .register_edge_irq_event(irq, &irq_evt)?
                                                     {
                                                         match wait_ctx.add(
                                                             ev,
@@ -1996,7 +2001,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                                     }
                                                 }
                                                 IrqSetup::Route(route) => irq_chip.route_irq(route),
-                                                IrqSetup::UnRegister(irq, ev) => irq_chip.unregister_irq_event(irq, ev),
+                                                IrqSetup::UnRegister(irq, ev) => {
+                                                    let irq_evt = devices::IrqEdgeEvent::from_event(ev.try_clone()?);
+                                                    irq_chip.unregister_edge_irq_event(irq, &irq_evt)
+                                                }
                                             },
                                             &mut sys_allocator,
                                         )

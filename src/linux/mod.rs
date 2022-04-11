@@ -15,6 +15,7 @@ use std::ops::RangeInclusive;
 use std::os::unix::net::UnixStream;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
@@ -89,6 +90,9 @@ pub use gpu::GpuRenderServerParameters;
 #[cfg(feature = "gpu")]
 use gpu::*;
 
+#[cfg(target_os = "android")]
+mod android;
+
 // gpu_device_tube is not used when GPU support is disabled.
 #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
 fn create_virtio_devices(
@@ -108,6 +112,7 @@ fn create_virtio_devices(
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
+    vvu_proxy_max_sibling_mem_size: u64,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -128,6 +133,7 @@ fn create_virtio_devices(
             cfg,
             opt,
             vvu_proxy_device_tubes.remove(0),
+            vvu_proxy_max_sibling_mem_size,
         )?);
     }
 
@@ -476,6 +482,7 @@ fn create_devices(
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     vvu_proxy_device_tubes: &mut Vec<Tube>,
+    vvu_proxy_max_sibling_mem_size: u64,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     let mut balloon_inflate_tube: Option<Tube> = None;
@@ -591,6 +598,7 @@ fn create_devices(
         #[cfg(feature = "gpu")]
         render_server_fd,
         vvu_proxy_device_tubes,
+        vvu_proxy_max_sibling_mem_size,
     )?;
 
     for stub in stubs {
@@ -1294,6 +1302,7 @@ where
         #[cfg(feature = "gpu")]
         render_server_fd,
         &mut vvu_proxy_device_tubes,
+        components.memory_size,
     )?;
 
     let mut hp_endpoints_ranges: Vec<RangeInclusive<u32>> = Vec::new();
@@ -1477,8 +1486,7 @@ fn add_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr =
-        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
+    let host_addr = PciAddress::from_str(host_str).context("failed to parse vfio pci address")?;
 
     let (hp_bus, bus_num) = get_hp_bus(linux, host_addr)?;
 
@@ -1545,8 +1553,7 @@ fn remove_vfio_device<V: VmArch, Vcpu: VcpuArch>(
     let host_str = host_os_str
         .to_str()
         .ok_or_else(|| anyhow!("failed to parse or find vfio path"))?;
-    let host_addr =
-        PciAddress::from_string(host_str).context("failed to parse vfio pci address")?;
+    let host_addr = PciAddress::from_str(host_str).context("failed to parse vfio pci address")?;
     let host_key = HostHotPlugKey::Vfio { host_addr };
     for hp_bus in linux.hotplug_bus.iter() {
         let mut hp_bus_lock = hp_bus.lock();
@@ -1724,6 +1731,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             Some(f)
         }
     };
+
+    #[cfg(target_os = "android")]
+    android::set_process_profiles(&cfg.task_profiles)?;
+
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let (to_vcpu_channel, from_main_channel) = mpsc::channel();
         let vcpu_affinity = match linux.vcpu_affinity.clone() {

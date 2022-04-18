@@ -908,7 +908,6 @@ pub enum ExitState {
     Crash,
     GuestPanic,
 }
-
 // Remove ranges in `guest_mem_layout` that overlap with ranges in `file_backed_mappings`.
 // Returns the updated guest memory layout.
 fn punch_holes_in_guest_mem_layout_for_mappings(
@@ -952,21 +951,7 @@ fn punch_holes_in_guest_mem_layout_for_mappings(
         .collect()
 }
 
-pub fn run_config(cfg: Config) -> Result<ExitState> {
-    let components = setup_vm_components(&cfg)?;
-
-    let guest_mem_layout =
-        Arch::guest_memory_layout(&components).context("failed to create guest memory layout")?;
-
-    let guest_mem_layout =
-        punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
-
-    let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
-    let mut mem_policy = MemoryPolicy::empty();
-    if components.hugepages {
-        mem_policy |= MemoryPolicy::USE_HUGEPAGES;
-    }
-    guest_mem.set_memory_policy(mem_policy);
+fn run_kvm(cfg: Config, components: VmComponents, guest_mem: GuestMemory) -> Result<ExitState> {
     let kvm = Kvm::new_with_path(&cfg.kvm_device_path).context("failed to create kvm")?;
     let vm = KvmVm::new(&kvm, guest_mem, components.protected_vm).context("failed to create vm")?;
 
@@ -1024,6 +1009,29 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     };
 
     run_vm::<KvmVcpu, KvmVm>(cfg, components, vm, irq_chip.as_mut(), ioapic_host_tube)
+}
+
+pub fn run_config(cfg: Config) -> Result<ExitState> {
+    let components = setup_vm_components(&cfg)?;
+
+    let guest_mem_layout =
+        Arch::guest_memory_layout(&components).context("failed to create guest memory layout")?;
+
+    let guest_mem_layout =
+        punch_holes_in_guest_mem_layout_for_mappings(guest_mem_layout, &cfg.file_backed_mappings);
+
+    let guest_mem = GuestMemory::new(&guest_mem_layout).context("failed to create guest memory")?;
+    let mut mem_policy = MemoryPolicy::empty();
+    if components.hugepages {
+        mem_policy |= MemoryPolicy::USE_HUGEPAGES;
+    }
+    guest_mem.set_memory_policy(mem_policy);
+
+    if cfg.kvm_device_path.exists() {
+        return run_kvm(cfg, components, guest_mem);
+    };
+
+    Err(anyhow!("No hypervsior available to run VM."))
 }
 
 fn run_vm<Vcpu, V>(
@@ -1379,7 +1387,7 @@ where
     }
 
     // KVM_CREATE_VCPU uses apic id for x86 and uses cpu id for others.
-    let mut kvm_vcpu_ids = Vec::new();
+    let mut vcpu_ids = Vec::new();
 
     #[cfg_attr(not(feature = "direct"), allow(unused_mut))]
     let mut linux = Arch::build_vm::<V, Vcpu>(
@@ -1394,7 +1402,7 @@ where
         ramoops_region,
         devices,
         irq_chip,
-        &mut kvm_vcpu_ids,
+        &mut vcpu_ids,
     )
     .context("the architecture failed to build the vm")?;
 
@@ -1457,7 +1465,7 @@ where
         sigchld_fd,
         Arc::clone(&map_request),
         gralloc,
-        kvm_vcpu_ids,
+        vcpu_ids,
         iommu_host_tube,
     )
 }
@@ -1630,7 +1638,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     sigchld_fd: SignalFd,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
     mut gralloc: RutabagaGralloc,
-    kvm_vcpu_ids: Vec<usize>,
+    vcpu_ids: Vec<usize>,
     iommu_host_tube: Option<Tube>,
 ) -> Result<ExitState> {
     #[derive(PollToken)]
@@ -1746,7 +1754,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         };
         let handle = vcpu::run_vcpu(
             cpu_id,
-            kvm_vcpu_ids[cpu_id],
+            vcpu_ids[cpu_id],
             vcpu,
             linux.vm.try_clone().context("failed to clone vm")?,
             linux

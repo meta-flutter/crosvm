@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use sync::Mutex;
 
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
 /// See [TimerFd](crate::platform::TimerFd) for struct- and method-level
 /// documentation.
@@ -18,13 +18,6 @@ pub struct Timer(pub TimerFd);
 impl Timer {
     pub fn new() -> Result<Timer> {
         TimerFd::new().map(Timer)
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for Timer {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
     }
 }
 

@@ -181,7 +181,7 @@ pub fn serialize_and_send<T: Serialize, F: Fn(&[u8]) -> io::Result<usize>>(
     let mut duped_descriptors = Vec::with_capacity(msg_descriptors.len());
     for desc in msg_descriptors {
         // Safe because these handles are guaranteed to be valid. Details:
-        // 1. They come from sys_util::descriptor_reflection::with_as_descriptor.
+        // 1. They come from base::descriptor_reflection::with_as_descriptor.
         // 2. with_as_descriptor is intended to be applied to owned descriptor types (e.g. File,
         //    SafeDescriptor).
         // 3. The owning object is borrowed by msg until sending is complete.
@@ -349,14 +349,14 @@ impl CloseNotifier for Tube {
     }
 }
 
-impl AsRawHandle for SendTube {
-    fn as_raw_handle(&self) -> RawHandle {
+impl AsRawDescriptor for SendTube {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
         self.0.as_raw_descriptor()
     }
 }
 
-impl AsRawHandle for RecvTube {
-    fn as_raw_handle(&self) -> RawHandle {
+impl AsRawDescriptor for RecvTube {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
         self.0.as_raw_descriptor()
     }
 }

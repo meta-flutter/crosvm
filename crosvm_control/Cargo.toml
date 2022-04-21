@@ -3,7 +3,6 @@ name = "crosvm_control"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
 edition = "2021"
-build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
@@ -14,4 +13,5 @@ vm_control = { path = "../vm_control" }
 libc = "0.2.65"
 
 [build-dependencies]
+anyhow = "*"
 cbindgen = "0.20.0"

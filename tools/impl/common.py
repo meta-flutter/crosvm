@@ -451,7 +451,7 @@ def batched(source: Iterable[T], max_batch_size: int) -> Iterable[list[T]]:
     """
     Returns an iterator over batches of elements from source_list.
 
-    >>> list(batched([1, 2, 3, 4, 5], batch_size=2))
+    >>> list(batched([1, 2, 3, 4, 5], 2))
     [[1, 2], [3, 4], [5]]
     """
     source_list = list(source)
@@ -537,7 +537,7 @@ def find_source_files(extension: str):
 
 def find_scripts(path: Path, shebang: str):
     for file in path.glob("*"):
-        if file.is_file() and file.read_text().startswith(f"#!{shebang}"):
+        if file.is_file() and file.open(errors="ignore").read(512).startswith(f"#!{shebang}"):
             yield file
 
 

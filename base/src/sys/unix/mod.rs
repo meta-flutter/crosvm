@@ -7,7 +7,7 @@
 // Fail sys_util compilation on windows.
 // This will make any unintentional windows code submitted to the crate unusable.
 #[cfg(windows)]
-compile_error!("sys_util is not windows friendly crate. See/use win_sys_util.");
+compile_error!("This is not windows friendly mod.");
 
 #[cfg(target_os = "android")]
 mod android;
@@ -17,6 +17,7 @@ use android as target_os;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as target_os;
+use log::warn;
 #[macro_use]
 pub mod handle_eintr;
 #[macro_use]
@@ -45,7 +46,7 @@ pub mod signal;
 mod signalfd;
 mod sock_ctrl_msg;
 mod terminal;
-mod timerfd;
+mod timer;
 pub mod vsock;
 mod write_zeroes;
 
@@ -78,7 +79,7 @@ pub use signal::*;
 pub use signalfd::*;
 pub use sock_ctrl_msg::*;
 pub use terminal::*;
-pub use timerfd::*;
+pub use timer::*;
 
 use crate::descriptor::{FromRawDescriptor, SafeDescriptor};
 pub use file_traits::{

@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
-use arch::{get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, VmComponents, VmImage};
+use arch::{
+    get_serial_cmdline, GetSerialCmdlineError, MsrExitHandler, RunnableLinuxVm, VmComponents,
+    VmImage,
+};
 use base::{Event, MemoryMappingBuilder};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
@@ -482,6 +485,7 @@ impl arch::LinuxArch for AArch64 {
         _has_bios: bool,
         _no_smt: bool,
         _host_cpu_topology: bool,
+        _itmt: bool,
     ) -> std::result::Result<(), Self::Error> {
         // AArch64 doesn't configure vcpus on the vcpu thread, so nothing to do here.
         Ok(())
@@ -635,3 +639,8 @@ impl AArch64 {
         Ok(())
     }
 }
+
+#[derive(Default)]
+pub struct MsrAArch64;
+
+impl MsrExitHandler for MsrAArch64 {}

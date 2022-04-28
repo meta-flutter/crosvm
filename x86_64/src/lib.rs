@@ -36,6 +36,8 @@ unsafe impl data_model::DataInit for mpspec::mpc_table {}
 unsafe impl data_model::DataInit for mpspec::mpc_lintsrc {}
 unsafe impl data_model::DataInit for mpspec::mpf_intel {}
 
+pub mod msr;
+
 mod acpi;
 mod bzimage;
 mod cpuid;
@@ -45,6 +47,7 @@ mod mptable;
 mod regs;
 mod smbios;
 
+use std::arch::x86_64::__cpuid;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
@@ -56,7 +59,10 @@ use std::sync::Arc;
 use crate::bootparam::boot_params;
 use acpi_tables::sdt::SDT;
 use acpi_tables::{aml, aml::Aml};
-use arch::{get_serial_cmdline, GetSerialCmdlineError, RunnableLinuxVm, VmComponents, VmImage};
+use arch::{
+    get_serial_cmdline, GetSerialCmdlineError, MsrAction, MsrConfig, MsrRWType, MsrValueFrom,
+    RunnableLinuxVm, VmComponents, VmImage,
+};
 use base::{warn, Event};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
@@ -76,6 +82,8 @@ use {
     gdbstub_arch::x86::reg::{X86SegmentRegs, X86_64CoreRegs},
     hypervisor::x86_64::{Regs, Sregs},
 };
+
+use crate::msr_index::*;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -680,6 +688,7 @@ impl arch::LinuxArch for X8664arch {
         has_bios: bool,
         no_smt: bool,
         host_cpu_topology: bool,
+        itmt: bool,
     ) -> Result<()> {
         cpuid::setup_cpuid(
             hypervisor,
@@ -689,6 +698,7 @@ impl arch::LinuxArch for X8664arch {
             num_cpus,
             no_smt,
             host_cpu_topology,
+            itmt,
         )
         .map_err(Error::SetupCpuid)?;
 
@@ -698,7 +708,14 @@ impl arch::LinuxArch for X8664arch {
 
         let guest_mem = vm.get_memory();
         let kernel_load_addr = GuestAddress(KERNEL_START_OFFSET);
-        regs::setup_msrs(vm, vcpu, END_ADDR_BEFORE_32BITS).map_err(Error::SetupMsrs)?;
+
+        let end_addr = guest_mem.end_addr().offset();
+        let (ram_low_end, ram_high_end) = if end_addr > FIRST_ADDR_PAST_32BITS {
+            (END_ADDR_BEFORE_32BITS, Some(end_addr))
+        } else {
+            (end_addr, None)
+        };
+        regs::setup_msrs(vm, vcpu, ram_low_end, ram_high_end).map_err(Error::SetupMsrs)?;
         let kernel_end = guest_mem
             .checked_offset(kernel_load_addr, KERNEL_64BIT_ENTRY_OFFSET)
             .ok_or(Error::KernelOffsetPastEnd)?;
@@ -1467,6 +1484,142 @@ impl X8664arch {
     }
 }
 
+#[sorted]
+#[derive(Error, Debug)]
+pub enum ItmtError {
+    #[error("CPU not support. Only intel CPUs support ITMT.")]
+    CpuUnSupport,
+    #[error("msr must be unique: {0}")]
+    MsrDuplicate(u32),
+}
+
+const EBX_INTEL_GENU: u32 = 0x756e6547; // "Genu"
+const ECX_INTEL_NTEL: u32 = 0x6c65746e; // "ntel"
+const EDX_INTEL_INEI: u32 = 0x49656e69; // "ineI"
+
+fn check_itmt_cpu_support() -> std::result::Result<(), ItmtError> {
+    // Safe because we pass 0 for this call and the host supports the
+    // `cpuid` instruction
+    let entry = unsafe { __cpuid(0) };
+    if entry.ebx == EBX_INTEL_GENU && entry.ecx == ECX_INTEL_NTEL && entry.edx == EDX_INTEL_INEI {
+        Ok(())
+    } else {
+        Err(ItmtError::CpuUnSupport)
+    }
+}
+
+pub fn set_itmt_msr_config(
+    msr_map: &mut BTreeMap<u32, MsrConfig>,
+) -> std::result::Result<(), ItmtError> {
+    check_itmt_cpu_support()?;
+
+    if msr_map
+        .insert(
+            MSR_HWP_CAPABILITIES,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: false,
+                },
+                action: Some(MsrAction::MsrPassthrough),
+                // Compatible with the configuration in initramfs.
+                // TODO(b:225375705): Change to `RWFromRunningCPU` in the future.
+                from: MsrValueFrom::RWFromCPU0,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_HWP_CAPABILITIES));
+    }
+
+    if msr_map
+        .insert(
+            MSR_PM_ENABLE,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: true,
+                },
+                action: Some(MsrAction::MsrEmulate),
+                from: MsrValueFrom::RWFromRunningCPU,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_PM_ENABLE));
+    }
+
+    if msr_map
+        .insert(
+            MSR_HWP_REQUEST,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: true,
+                },
+                action: Some(MsrAction::MsrEmulate),
+                from: MsrValueFrom::RWFromRunningCPU,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_HWP_REQUEST));
+    }
+
+    if msr_map
+        .insert(
+            MSR_TURBO_RATIO_LIMIT,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: false,
+                },
+                action: Some(MsrAction::MsrPassthrough),
+                from: MsrValueFrom::RWFromRunningCPU,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_TURBO_RATIO_LIMIT));
+    }
+
+    if msr_map
+        .insert(
+            MSR_PLATFORM_INFO,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: false,
+                },
+                action: Some(MsrAction::MsrPassthrough),
+                from: MsrValueFrom::RWFromRunningCPU,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_PLATFORM_INFO));
+    }
+
+    if msr_map
+        .insert(
+            MSR_IA32_PERF_CTL,
+            MsrConfig {
+                rw_type: MsrRWType {
+                    read_allow: true,
+                    write_allow: true,
+                },
+                action: Some(MsrAction::MsrEmulate),
+                from: MsrValueFrom::RWFromRunningCPU,
+            },
+        )
+        .is_some()
+    {
+        return Err(ItmtError::MsrDuplicate(MSR_IA32_PERF_CTL));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test_integration;
 
@@ -1573,7 +1726,7 @@ mod tests {
 
     #[test]
     fn check_32bit_gap_size_alignment() {
-        // 32bit gap memory is 256 MB aligned to be friendly for MTRR mappings.
-        assert_eq!(MEM_32BIT_GAP_SIZE % (256 * MB), 0);
+        // END_ADDR_BEFORE_32BITS is 256 MB aligned to be friendly for MTRR mappings.
+        assert_eq!(END_ADDR_BEFORE_32BITS % (256 * MB), 0);
     }
 }

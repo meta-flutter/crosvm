@@ -4,11 +4,6 @@
 
 //! Small system utility modules for usage by other modules.
 
-// Fail sys_util compilation on windows.
-// This will make any unintentional windows code submitted to the crate unusable.
-#[cfg(windows)]
-compile_error!("This is not windows friendly mod.");
-
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "android")]
@@ -26,7 +21,6 @@ pub mod ioctl;
 pub mod syslog;
 mod acpi_event;
 mod capabilities;
-mod clock;
 mod descriptor;
 mod eventfd;
 mod file_flags;
@@ -61,7 +55,6 @@ pub use crate::{
 pub use acpi_event::*;
 pub use base_poll_token_derive::*;
 pub use capabilities::drop_capabilities;
-pub use clock::{Clock, FakeClock};
 pub use descriptor::*;
 pub use eventfd::*;
 pub use file_flags::*;

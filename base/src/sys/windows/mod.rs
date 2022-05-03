@@ -9,12 +9,10 @@
 #[macro_use]
 pub mod win;
 
-#[path = "win/ioctl.rs"]
 #[macro_use]
 pub mod ioctl;
 #[macro_use]
 pub mod syslog;
-mod clock;
 #[path = "win/console.rs"]
 mod console;
 mod descriptor;
@@ -48,7 +46,6 @@ pub use crate::descriptor_reflection::{
 };
 pub use crate::errno::{Error, Result, *};
 pub use base_poll_token_derive::*;
-pub use clock::{Clock, FakeClock};
 pub use console::*;
 pub use descriptor::*;
 pub use event::*;

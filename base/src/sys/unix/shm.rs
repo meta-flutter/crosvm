@@ -19,10 +19,11 @@ use libc::{
 use serde::{Deserialize, Serialize};
 
 use super::{errno_result, Error, Result};
-use crate::{AsRawDescriptor, RawDescriptor};
+use crate::SharedMemory as CrateSharedMemory;
+use crate::{AsRawDescriptor, IntoRawDescriptor, RawDescriptor, SafeDescriptor};
 
 /// A shared memory file descriptor and its size.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SharedMemory {
     #[serde(with = "super::with_as_descriptor")]
     fd: File,
@@ -151,6 +152,18 @@ impl SharedMemory {
         let file = unsafe { File::from_raw_fd(fd) };
 
         Ok(SharedMemory { fd: file, size: 0 })
+    }
+
+    /// Creates a SharedMemory instance from a SafeDescriptor owning a reference to a
+    /// shared memory descriptor. Ownership of the underlying descriptor is transferred to the
+    /// new SharedMemory object.
+    pub fn from_safe_descriptor(
+        descriptor: SafeDescriptor,
+        size: Option<u64>,
+    ) -> Result<SharedMemory> {
+        let mut file = unsafe { File::from_raw_fd(descriptor.into_raw_descriptor()) };
+        let size = size.unwrap_or(file.seek(SeekFrom::End(0))?);
+        Ok(SharedMemory { fd: file, size })
     }
 
     /// Constructs a `SharedMemory` instance from a `File` that represents shared memory.
@@ -317,6 +330,26 @@ pub fn kernel_has_memfd() -> bool {
         close(fd);
     }
     true
+}
+
+pub trait Unix {
+    fn from_file(file: File) -> Result<CrateSharedMemory> {
+        SharedMemory::from_file(file).map(CrateSharedMemory)
+    }
+
+    fn get_seals(&self) -> Result<MemfdSeals>;
+
+    fn add_seals(&mut self, seals: MemfdSeals) -> Result<()>;
+}
+
+impl Unix for CrateSharedMemory {
+    fn get_seals(&self) -> Result<MemfdSeals> {
+        self.0.get_seals()
+    }
+
+    fn add_seals(&mut self, seals: MemfdSeals) -> Result<()> {
+        self.0.add_seals(seals)
+    }
 }
 
 #[cfg(test)]

@@ -62,7 +62,7 @@ impl Kvm {
             ipa => ipa as u32,
         };
         let protection_flag = match protection_type {
-            ProtectionType::Unprotected => 0,
+            ProtectionType::Unprotected | ProtectionType::UnprotectedWithFirmware => 0,
             ProtectionType::Protected | ProtectionType::ProtectedWithoutFirmware => {
                 KVM_VM_TYPE_ARM_PROTECTED
             }
@@ -313,6 +313,17 @@ impl VcpuAArch64 for KvmVcpu {
                 VcpuFeature::PowerOff => KVM_ARM_VCPU_POWER_OFF,
             };
             kvi.features[0] |= 1 << shift;
+        }
+
+        // Safe because we know self.vm is a real kvm fd
+        let check_extension = |ext: u32| -> bool {
+            unsafe { ioctl_with_val(&self.vm, KVM_CHECK_EXTENSION(), ext.into()) == 1 }
+        };
+        if check_extension(KVM_CAP_ARM_PTRAUTH_ADDRESS)
+            && check_extension(KVM_CAP_ARM_PTRAUTH_GENERIC)
+        {
+            kvi.features[0] |= 1 << KVM_ARM_VCPU_PTRAUTH_ADDRESS;
+            kvi.features[0] |= 1 << KVM_ARM_VCPU_PTRAUTH_GENERIC;
         }
 
         // Safe because we allocated the struct and we know the kernel will read exactly the size of

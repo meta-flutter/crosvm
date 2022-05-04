@@ -3,19 +3,19 @@
 // found in the LICENSE file.
 
 use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor};
-use crate::{Error, MemfdSeals, RawDescriptor, Result};
+use crate::{Error, RawDescriptor, Result};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
-use std::{ffi::CStr, fs::File, os::unix::io::IntoRawFd};
+use std::{ffi::CStr, os::unix::io::IntoRawFd};
 
 use crate::platform::SharedMemory as SysUtilSharedMemory;
 use serde::{Deserialize, Serialize};
 
 /// See [SharedMemory](crate::platform::SharedMemory) for struct- and method-level
 /// documentation.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SharedMemory(SysUtilSharedMemory);
+pub struct SharedMemory(pub(crate) SysUtilSharedMemory);
 impl SharedMemory {
     pub fn named<T: Into<Vec<u8>>>(name: T, size: u64) -> Result<SharedMemory> {
         SysUtilSharedMemory::named(name)
@@ -36,33 +36,18 @@ impl SharedMemory {
     pub fn size(&self) -> u64 {
         self.0.size()
     }
-}
 
-pub trait Unix {
     /// Creates a SharedMemory instance from a SafeDescriptor owning a reference to a
     /// shared memory descriptor. Ownership of the underlying descriptor is transferred to the
     /// new SharedMemory object.
-    fn from_safe_descriptor(descriptor: SafeDescriptor) -> Result<SharedMemory> {
-        let file = unsafe { File::from_raw_descriptor(descriptor.into_raw_descriptor()) };
-        SysUtilSharedMemory::from_file(file).map(SharedMemory)
-    }
-
-    fn from_file(file: File) -> Result<SharedMemory> {
-        SysUtilSharedMemory::from_file(file).map(SharedMemory)
-    }
-
-    fn get_seals(&self) -> Result<MemfdSeals>;
-
-    fn add_seals(&mut self, seals: MemfdSeals) -> Result<()>;
-}
-
-impl Unix for SharedMemory {
-    fn get_seals(&self) -> Result<MemfdSeals> {
-        self.0.get_seals()
-    }
-
-    fn add_seals(&mut self, seals: MemfdSeals) -> Result<()> {
-        self.0.add_seals(seals)
+    /// `size` needs to be Some() on windows.
+    /// On unix, when `size` is Some(value), the mapping size is set to `value`.
+    // TODO(b:231319974): Make size non-optional arg.
+    pub fn from_safe_descriptor(
+        descriptor: SafeDescriptor,
+        size: Option<u64>,
+    ) -> Result<SharedMemory> {
+        SysUtilSharedMemory::from_safe_descriptor(descriptor, size).map(SharedMemory)
     }
 }
 

@@ -4,9 +4,7 @@
 
 use std::{
     fs::File,
-    io::{
-        Error, ErrorKind, Seek, SeekFrom, {self},
-    },
+    io::{self, Error, ErrorKind},
 };
 
 #[path = "win/punch_hole.rs"]
@@ -26,35 +24,6 @@ pub trait PunchHole {
 impl PunchHole for File {
     fn punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()> {
         execute_punch_hole(self, offset, length)
-    }
-}
-
-/// A trait for writing zeroes to a stream.
-pub trait WriteZeroes {
-    /// Write up to `length` bytes of zeroes to the stream, returning how many bytes were written.
-    fn write_zeroes(&mut self, length: usize) -> io::Result<usize>;
-
-    /// Write zeroes to the stream until `length` bytes have been written.
-    ///
-    /// This method will continuously call `write_zeroes` until the requested
-    /// `length` is satisfied or an error is encountered.
-    fn write_zeroes_all(&mut self, mut length: usize) -> io::Result<()> {
-        while length > 0 {
-            match self.write_zeroes(length) {
-                Ok(0) => return Err(Error::from(ErrorKind::WriteZero)),
-                Ok(bytes_written) => {
-                    length = length
-                        .checked_sub(bytes_written)
-                        .ok_or_else(|| Error::from(ErrorKind::Other))?
-                }
-                Err(e) => {
-                    if e.kind() != ErrorKind::Interrupted {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -91,16 +60,6 @@ pub trait WriteZeroesAt {
     }
 }
 
-impl<T: WriteZeroesAt + Seek> WriteZeroes for T {
-    fn write_zeroes(&mut self, length: usize) -> io::Result<usize> {
-        let offset = self.seek(SeekFrom::Current(0))?;
-        let nwritten = self.write_zeroes_at(offset, length)?;
-        // Advance the seek cursor as if we had done a real write().
-        self.seek(SeekFrom::Current(nwritten as i64))?;
-        Ok(length)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +69,6 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    #[cfg_attr(all(target_os = "windows", target_env = "gnu"), ignore)]
     #[test]
     fn simple_test() {
         let tempdir = TempDir::new().unwrap();
@@ -122,7 +80,11 @@ mod tests {
             .create(true)
             .open(&path)
             .unwrap();
-        f.set_len(16384).unwrap();
+
+        // Extend and fill the file with zero bytes.
+        // This is not using set_len() because that fails on wine.
+        let init_data = [0x00u8; 16384];
+        f.write_all(&init_data).unwrap();
 
         // Write buffer of non-zero bytes to offset 1234
         let orig_data = [0x55u8; 5678];
@@ -147,10 +109,8 @@ mod tests {
         }
 
         // Overwrite some of the data with zeroes
-        f.seek(SeekFrom::Start(2345)).unwrap();
-        f.write_zeroes_all(4321).expect("write_zeroes failed");
-        // Verify seek position after write_zeroes_all()
-        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 2345 + 4321);
+        f.write_zeroes_all_at(2345, 4321)
+            .expect("write_zeroes failed");
 
         // Read back the data and verify that it is now zero
         f.seek(SeekFrom::Start(0)).unwrap();
@@ -178,7 +138,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(all(target_os = "windows", target_env = "gnu"), ignore)]
     fn large_write_zeroes() {
         let tempdir = TempDir::new().unwrap();
         let mut path = tempdir.path().to_owned();
@@ -189,7 +148,11 @@ mod tests {
             .create(true)
             .open(&path)
             .unwrap();
-        f.set_len(16384).unwrap();
+
+        // Extend and fill the file with zero bytes.
+        // This is not using set_len() because that fails on wine.
+        let init_data = [0x00u8; 16384];
+        f.write_all(&init_data).unwrap();
 
         // Write buffer of non-zero bytes
         let orig_data = [0x55u8; 0x20000];
@@ -197,10 +160,8 @@ mod tests {
         f.write_all(&orig_data).unwrap();
 
         // Overwrite some of the data with zeroes
-        f.seek(SeekFrom::Start(0)).unwrap();
-        f.write_zeroes_all(0x10001).expect("write_zeroes failed");
-        // Verify seek position after write_zeroes_all()
-        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 0x10001);
+        f.write_zeroes_all_at(0, 0x10001)
+            .expect("write_zeroes failed");
 
         // Read back the data and verify that it is now zero
         let mut readback = [0u8; 0x20000];

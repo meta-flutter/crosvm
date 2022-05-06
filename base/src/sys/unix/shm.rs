@@ -8,7 +8,6 @@ use std::{
     io::{
         Read, Seek, SeekFrom, Write, {self},
     },
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
 };
 
 use libc::{
@@ -19,8 +18,8 @@ use libc::{
 use serde::{Deserialize, Serialize};
 
 use super::{errno_result, Error, Result};
-use crate::SharedMemory as CrateSharedMemory;
 use crate::{AsRawDescriptor, IntoRawDescriptor, RawDescriptor, SafeDescriptor};
+use crate::{FromRawDescriptor, SharedMemory as CrateSharedMemory};
 
 /// A shared memory file descriptor and its size.
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,13 +122,16 @@ impl SharedMemory {
     ///
     /// Note that the given name may not have NUL characters anywhere in it, or this will return an
     /// error.
-    pub fn named<T: Into<Vec<u8>>>(name: T) -> Result<SharedMemory> {
-        Self::new(Some(&CString::new(name).map_err(|_| Error::new(EINVAL))?))
+    pub fn named<T: Into<Vec<u8>>>(name: T, size: u64) -> Result<SharedMemory> {
+        Self::new(
+            Some(&CString::new(name).map_err(|_| Error::new(EINVAL))?),
+            size,
+        )
     }
 
     /// Convenience function for `SharedMemory::new` that has an arbitrary and unspecified name.
     pub fn anon() -> Result<SharedMemory> {
-        Self::new(None)
+        Self::new(None, 0)
     }
 
     /// Creates a new shared memory file descriptor with zero size.
@@ -138,7 +140,7 @@ impl SharedMemory {
     /// debugging. The name does not need to be unique.
     ///
     /// The file descriptor is opened with the close on exec flag and allows memfd sealing.
-    pub fn new(name: Option<&CStr>) -> Result<SharedMemory> {
+    pub fn new(name: Option<&CStr>, size: u64) -> Result<SharedMemory> {
         let shm_name = name
             .map(|n| n.as_ptr())
             .unwrap_or(b"/crosvm_shm\0".as_ptr() as *const c_char);
@@ -149,9 +151,11 @@ impl SharedMemory {
             return errno_result();
         }
 
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = unsafe { File::from_raw_descriptor(fd) };
 
-        Ok(SharedMemory { fd: file, size: 0 })
+        let mut shm = SharedMemory { fd: file, size: 0 };
+        shm.set_size(size)?;
+        Ok(shm)
     }
 
     /// Creates a SharedMemory instance from a SafeDescriptor owning a reference to a
@@ -161,7 +165,7 @@ impl SharedMemory {
         descriptor: SafeDescriptor,
         size: Option<u64>,
     ) -> Result<SharedMemory> {
-        let mut file = unsafe { File::from_raw_fd(descriptor.into_raw_descriptor()) };
+        let mut file = unsafe { File::from_raw_descriptor(descriptor.into_raw_descriptor()) };
         let size = size.unwrap_or(file.seek(SeekFrom::End(0))?);
         Ok(SharedMemory { fd: file, size })
     }
@@ -182,7 +186,7 @@ impl SharedMemory {
     ///
     /// This may fail if this instance was not constructed from a memfd.
     pub fn get_seals(&self) -> Result<MemfdSeals> {
-        let ret = unsafe { fcntl(self.fd.as_raw_fd(), F_GET_SEALS) };
+        let ret = unsafe { fcntl(self.fd.as_raw_descriptor(), F_GET_SEALS) };
         if ret < 0 {
             return errno_result();
         }
@@ -194,7 +198,7 @@ impl SharedMemory {
     /// This may fail if this instance was not constructed from a memfd with sealing allowed or if
     /// the seal seal (`F_SEAL_SEAL`) bit was already added.
     pub fn add_seals(&mut self, seals: MemfdSeals) -> Result<()> {
-        let ret = unsafe { fcntl(self.fd.as_raw_fd(), F_ADD_SEALS, seals) };
+        let ret = unsafe { fcntl(self.fd.as_raw_descriptor(), F_ADD_SEALS, seals) };
         if ret < 0 {
             return errno_result();
         }
@@ -214,7 +218,7 @@ impl SharedMemory {
     /// Note that if some process has already mapped this shared memory and the new size is smaller,
     /// that process may get signaled with SIGBUS if they access any page past the new size.
     pub fn set_size(&mut self, size: u64) -> Result<()> {
-        let ret = unsafe { ftruncate64(self.fd.as_raw_fd(), size as off64_t) };
+        let ret = unsafe { ftruncate64(self.fd.as_raw_descriptor(), size as off64_t) };
         if ret < 0 {
             return errno_result();
         }
@@ -228,7 +232,7 @@ impl SharedMemory {
     /// results are undefined. Because this returns a `String`, the name's bytes are interpreted as
     /// utf-8.
     pub fn read_name(&self) -> Result<String> {
-        let fd_path = format!("/proc/self/fd/{}", self.as_raw_fd());
+        let fd_path = format!("/proc/self/fd/{}", self.as_raw_descriptor());
         let link_name = read_link(fd_path)?;
         link_name
             .to_str()
@@ -285,27 +289,15 @@ impl Seek for &SharedMemory {
     }
 }
 
-impl AsRawFd for SharedMemory {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-impl AsRawFd for &SharedMemory {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-impl IntoRawFd for SharedMemory {
-    fn into_raw_fd(self) -> RawFd {
-        self.fd.into_raw_fd()
-    }
-}
-
 impl AsRawDescriptor for SharedMemory {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.fd.as_raw_descriptor()
+    }
+}
+
+impl IntoRawDescriptor for SharedMemory {
+    fn into_raw_descriptor(self) -> RawDescriptor {
+        self.fd.into_raw_descriptor()
     }
 }
 
@@ -368,7 +360,7 @@ mod tests {
             return;
         }
         const TEST_NAME: &str = "Name McCool Person";
-        let shm = SharedMemory::named(TEST_NAME).expect("failed to create shared memory");
+        let shm = SharedMemory::named(TEST_NAME, 0).expect("failed to create shared memory");
         assert_eq!(shm.read_name(), Ok(TEST_NAME.to_owned()));
     }
 
@@ -428,7 +420,7 @@ mod tests {
         }
         let name = "very unique name";
         let cname = CString::new(name).unwrap();
-        let shm = SharedMemory::new(Some(&cname)).expect("failed to create shared memory");
+        let shm = SharedMemory::new(Some(&cname), 0).expect("failed to create shared memory");
         assert_eq!(shm.read_name(), Ok(name.to_owned()));
     }
 

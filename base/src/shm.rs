@@ -4,9 +4,7 @@
 
 use crate::descriptor::{AsRawDescriptor, FromRawDescriptor, IntoRawDescriptor, SafeDescriptor};
 use crate::{Error, RawDescriptor, Result};
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
-use std::{ffi::CStr, os::unix::io::IntoRawFd};
+use std::ffi::CStr;
 
 use crate::platform::SharedMemory as SysUtilSharedMemory;
 use serde::{Deserialize, Serialize};
@@ -18,9 +16,7 @@ use serde::{Deserialize, Serialize};
 pub struct SharedMemory(pub(crate) SysUtilSharedMemory);
 impl SharedMemory {
     pub fn named<T: Into<Vec<u8>>>(name: T, size: u64) -> Result<SharedMemory> {
-        SysUtilSharedMemory::named(name)
-            .and_then(|mut shm| shm.set_size(size).map(|_| shm))
-            .map(SharedMemory)
+        SysUtilSharedMemory::named(name, size).map(SharedMemory)
     }
 
     pub fn anon(size: u64) -> Result<SharedMemory> {
@@ -28,9 +24,7 @@ impl SharedMemory {
     }
 
     pub fn new(name: Option<&CStr>, size: u64) -> Result<SharedMemory> {
-        SysUtilSharedMemory::new(name)
-            .and_then(|mut shm| shm.set_size(size).map(|_| shm))
-            .map(SharedMemory)
+        SysUtilSharedMemory::new(name, size).map(SharedMemory)
     }
 
     pub fn size(&self) -> u64 {
@@ -59,7 +53,7 @@ impl AsRawDescriptor for SharedMemory {
 
 impl IntoRawDescriptor for SharedMemory {
     fn into_raw_descriptor(self) -> RawDescriptor {
-        self.0.into_raw_fd()
+        self.0.into_raw_descriptor()
     }
 }
 
@@ -82,7 +76,7 @@ impl audio_streams::shm_streams::SharedMemory for SharedMemory {
     }
 
     #[cfg(unix)]
-    fn as_raw_fd(&self) -> RawFd {
+    fn as_raw_fd(&self) -> RawDescriptor {
         self.as_raw_descriptor()
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::descriptor::AsRawDescriptor;
 use crate::{
-    platform::{EventContext, PollToken, WatchingEvents},
+    platform::{EventContext, PollToken},
     RawDescriptor, Result,
 };
 use smallvec::SmallVec;
@@ -44,24 +44,48 @@ pub enum EventType {
 /// # Example
 ///
 /// ```
-/// # use base::{
-///     Result, Event, WaitContext,
-/// };
-/// # fn test() -> Result<()> {
-///     let evt1 = Event::new()?;
-///     let evt2 = Event::new()?;
-///     evt2.write(1)?;
+/// use base::{Event, PollToken, Result, WaitContext};
 ///
-///     let ctx: WaitContext<u32> = WaitContext::new()?;
-///     ctx.add(&evt1, 1)?;
-///     ctx.add(&evt2, 2)?;
+/// #[derive(PollToken, Copy, Clone, Debug, PartialEq)]
+/// enum ExampleToken {
+///    SomeEvent(u32),
+///    AnotherEvent,
+/// }
 ///
-///     let events = ctx.wait()?;
-///     let tokens: Vec<u32> = events.iter().filter(|e| e.is_readable)
-///         .map(|e| e.token).collect();
-///     assert_eq!(tokens, [2]);
-/// #   Ok(())
-/// # }
+/// let evt1 = Event::new()?;
+/// let evt2 = Event::new()?;
+/// let another_evt = Event::new()?;
+///
+/// let ctx: WaitContext<ExampleToken> = WaitContext::build_with(&[
+///     (&evt1, ExampleToken::SomeEvent(1)),
+///     (&evt2, ExampleToken::SomeEvent(2)),
+///     (&another_evt, ExampleToken::AnotherEvent),
+/// ])?;
+///
+/// // Trigger one of the `SomeEvent` events.
+/// evt2.write(1)?;
+///
+/// // Wait for an event to fire. `wait()` will return immediately in this example because `evt2`
+/// // has already been triggered, but in normal use, `wait()` will block until at least one event
+/// // is signaled by another thread or process.
+/// let events = ctx.wait()?;
+/// let tokens: Vec<ExampleToken> = events.iter().filter(|e| e.is_readable)
+///     .map(|e| e.token).collect();
+/// assert_eq!(tokens, [ExampleToken::SomeEvent(2)]);
+///
+/// // Reset evt2 so it doesn't trigger again in the next `wait()` call.
+/// let _ = evt2.read()?;
+///
+/// // Trigger a different event.
+/// another_evt.write(1)?;
+///
+/// let events = ctx.wait()?;
+/// let tokens: Vec<ExampleToken> = events.iter().filter(|e| e.is_readable)
+///     .map(|e| e.token).collect();
+/// assert_eq!(tokens, [ExampleToken::AnotherEvent]);
+///
+/// let _ = another_evt.read()?;
+/// # Ok::<(), base::Error>(())
 /// ```
 pub struct WaitContext<T: EventToken>(EventContext<T>);
 
@@ -90,8 +114,7 @@ impl<T: EventToken> WaitContext<T> {
         event_type: EventType,
         token: T,
     ) -> Result<()> {
-        self.0
-            .add_fd_with_events(descriptor, convert_to_watching_events(event_type), token)
+        self.0.add_for_event(descriptor, event_type, token)
     }
 
     /// Adds multiple triggers to the WaitContext.
@@ -110,8 +133,7 @@ impl<T: EventToken> WaitContext<T> {
         event_type: EventType,
         token: T,
     ) -> Result<()> {
-        self.0
-            .modify(descriptor, convert_to_watching_events(event_type), token)
+        self.0.modify(descriptor, event_type, token)
     }
 
     /// Removes the given handle from triggers registered in the WaitContext if
@@ -143,14 +165,5 @@ impl<T: EventToken> WaitContext<T> {
 impl<T: PollToken> AsRawDescriptor for WaitContext<T> {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.0.as_raw_descriptor()
-    }
-}
-
-fn convert_to_watching_events(event_type: EventType) -> WatchingEvents {
-    match event_type {
-        EventType::None => WatchingEvents::empty(),
-        EventType::Read => WatchingEvents::empty().set_read(),
-        EventType::Write => WatchingEvents::empty().set_write(),
-        EventType::ReadWrite => WatchingEvents::empty().set_read().set_write(),
     }
 }

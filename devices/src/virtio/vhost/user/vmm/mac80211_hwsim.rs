@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
-use std::u32;
 
 use base::{error, Event, RawDescriptor};
 use remain::sorted;
@@ -15,7 +14,7 @@ use vm_memory::GuestMemory;
 use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
 use crate::virtio::vhost::user::vmm::{handler::VhostUserHandler, worker::Worker, Error};
-use crate::virtio::{Interrupt, Queue, VirtioDevice, TYPE_MAC80211_HWSIM, VIRTIO_F_VERSION_1};
+use crate::virtio::{DeviceType, Interrupt, Queue, VirtioDevice};
 
 use std::result::Result;
 
@@ -44,9 +43,7 @@ impl Mac80211Hwsim {
     pub fn new<P: AsRef<Path>>(base_features: u64, socket_path: P) -> Result<Mac80211Hwsim, Error> {
         let socket = UnixStream::connect(&socket_path).map_err(Error::SocketConnect)?;
 
-        let allow_features = 1 << VIRTIO_F_VERSION_1
-            | base_features
-            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let allow_features = base_features | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let init_features = base_features | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let allow_protocol_features = VhostUserProtocolFeatures::empty();
 
@@ -135,8 +132,8 @@ impl VirtioDevice for Mac80211Hwsim {
         }
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_MAC80211_HWSIM
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Mac80211HwSim
     }
 
     fn queue_max_sizes(&self) -> &[u16] {

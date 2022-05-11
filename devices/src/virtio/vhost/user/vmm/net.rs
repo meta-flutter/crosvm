@@ -6,16 +6,14 @@ mod sys;
 
 use std::cell::RefCell;
 use std::thread;
-use std::u32;
 
 use base::{error, Event, RawDescriptor};
 use virtio_sys::virtio_net;
-use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 
 use crate::virtio::vhost::user::vmm::{handler::VhostUserHandler, worker::Worker, Error};
-use crate::virtio::{Interrupt, Queue, VirtioDevice, VirtioNetConfig, TYPE_NET};
+use crate::virtio::{DeviceType, Interrupt, Queue, VirtioDevice, VirtioNetConfig};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -30,7 +28,7 @@ pub struct Net {
 
 impl Net {
     fn get_all_features(base_features: u64) -> (u64, u64, VhostUserProtocolFeatures) {
-        let allow_features = 1 << crate::virtio::VIRTIO_F_VERSION_1
+        let allow_features = base_features
             | 1 << virtio_net::VIRTIO_NET_F_CSUM
             | 1 << virtio_net::VIRTIO_NET_F_CTRL_VQ
             | 1 << virtio_net::VIRTIO_NET_F_CTRL_GUEST_OFFLOADS
@@ -40,8 +38,6 @@ impl Net {
             | 1 << virtio_net::VIRTIO_NET_F_HOST_TSO4
             | 1 << virtio_net::VIRTIO_NET_F_HOST_UFO
             | 1 << virtio_net::VIRTIO_NET_F_MQ
-            | 1 << VIRTIO_RING_F_EVENT_IDX
-            | base_features
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let init_features = base_features | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let allow_protocol_features =
@@ -79,8 +75,8 @@ impl VirtioDevice for Net {
         }
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_NET
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Net
     }
 
     fn queue_max_sizes(&self) -> &[u16] {

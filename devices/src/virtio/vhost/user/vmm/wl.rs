@@ -14,7 +14,7 @@ use crate::virtio::vhost::user::vmm::{worker::Worker, Result, VhostUserHandler};
 use crate::virtio::wl::{
     QUEUE_SIZE, QUEUE_SIZES, VIRTIO_WL_F_SEND_FENCES, VIRTIO_WL_F_TRANS_FLAGS,
 };
-use crate::virtio::{Interrupt, Queue, VirtioDevice, TYPE_WL};
+use crate::virtio::{DeviceType, Interrupt, Queue, VirtioDevice};
 
 pub struct Wl {
     kill_evt: Option<Event>,
@@ -27,10 +27,9 @@ impl Wl {
     pub fn new<P: AsRef<Path>>(base_features: u64, socket_path: P) -> Result<Wl> {
         let default_queue_size = QUEUE_SIZES.len();
 
-        let allow_features = 1u64 << crate::virtio::VIRTIO_F_VERSION_1
+        let allow_features = base_features
             | 1 << VIRTIO_WL_F_TRANS_FLAGS
             | 1 << VIRTIO_WL_F_SEND_FENCES
-            | base_features
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let init_features = base_features | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let allow_protocol_features =
@@ -59,8 +58,8 @@ impl VirtioDevice for Wl {
         Vec::new()
     }
 
-    fn device_type(&self) -> u32 {
-        TYPE_WL
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Wl
     }
 
     fn queue_max_sizes(&self) -> &[u16] {

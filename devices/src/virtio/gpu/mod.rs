@@ -8,7 +8,7 @@ mod udmabuf_bindings;
 mod virtio_gpu;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::TryFrom;
 use std::i64;
 use std::io::Read;
@@ -140,7 +140,7 @@ pub struct VirtioScanoutBlobData {
     pub offsets: [u32; 4],
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
@@ -156,7 +156,7 @@ struct FenceDescriptor {
 #[derive(Default)]
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
-    completed_fences: HashMap<VirtioGpuRing, u64>,
+    completed_fences: BTreeMap<VirtioGpuRing, u64>,
 }
 
 pub trait QueueReader {
@@ -787,6 +787,10 @@ impl Frontend {
     pub fn has_pending_fences(&self) -> bool {
         !self.fence_state.lock().descs.is_empty()
     }
+
+    pub fn event_poll(&self) {
+        self.virtio_gpu.event_poll();
+    }
 }
 
 struct Worker {
@@ -812,6 +816,7 @@ impl Worker {
             InterruptResample,
             Kill,
             ResourceBridge { index: usize },
+            VirtioGpuPoll,
         }
 
         let wait_ctx: WaitContext<Token> = match WaitContext::build_with(&[
@@ -836,6 +841,13 @@ impl Worker {
             }
         }
 
+        if let Some(poll_desc) = self.state.virtio_gpu.poll_descriptor() {
+            if let Err(e) = wait_ctx.add(&poll_desc, Token::VirtioGpuPoll) {
+                error!("failed adding poll eventfd to WaitContext: {}", e);
+                return;
+            }
+        }
+
         for (index, bridge) in self.resource_bridges.iter().enumerate() {
             if let Err(e) = wait_ctx.add(bridge, Token::ResourceBridge { index }) {
                 error!("failed to add resource bridge to WaitContext: {}", e);
@@ -854,11 +866,12 @@ impl Worker {
         let mut process_resource_bridge = Vec::with_capacity(self.resource_bridges.len());
         'wait: loop {
             // If there are outstanding fences, wake up early to poll them.
-            let duration = if self.state.has_pending_fences() {
-                FENCE_POLL_INTERVAL
-            } else {
-                Duration::new(i64::MAX as u64, 0)
-            };
+            let duration =
+                if self.state.virtio_gpu.needs_fence_poll() && self.state.has_pending_fences() {
+                    FENCE_POLL_INTERVAL
+                } else {
+                    Duration::new(i64::MAX as u64, 0)
+                };
 
             let events = match wait_ctx.wait_timeout(duration) {
                 Ok(v) => v,
@@ -910,6 +923,9 @@ impl Worker {
                     Token::InterruptResample => {
                         self.interrupt.interrupt_resample();
                     }
+                    Token::VirtioGpuPoll => {
+                        self.state.event_poll();
+                    }
                     Token::Kill => {
                         break 'wait;
                     }
@@ -926,7 +942,9 @@ impl Worker {
                 signal_used_ctrl = true;
             }
 
-            self.state.fence_poll();
+            if self.state.virtio_gpu.needs_fence_poll() {
+                self.state.fence_poll();
+            }
 
             // Process the entire control queue before the resource bridge in case a resource is
             // created or destroyed by the control queue. Processing the resource bridge first may
@@ -1032,7 +1050,8 @@ impl Gpu {
             .use_surfaceless(gpu_parameters.renderer_use_surfaceless)
             .use_guest_angle(gpu_parameters.gfxstream_use_guest_angle)
             .use_syncfd(gpu_parameters.gfxstream_use_syncfd)
-            .use_vulkan(gpu_parameters.use_vulkan);
+            .use_vulkan(gpu_parameters.use_vulkan)
+            .use_async_fence_cb(true);
 
         let mut rutabaga_channels: Vec<RutabagaChannel> = Vec::new();
         for (channel_name, path) in &channels {

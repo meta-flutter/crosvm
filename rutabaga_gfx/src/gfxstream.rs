@@ -59,7 +59,7 @@ pub struct VirglRendererCallbacks {
 
     pub get_drm_fd: Option<unsafe extern "C" fn(cookie: *mut c_void) -> c_int>,
     pub write_context_fence:
-        Option<unsafe extern "C" fn(cookie: *mut c_void, fence: u64, ctx_idx: u32, ring_idx: u8)>,
+        unsafe extern "C" fn(cookie: *mut c_void, fence_id: u64, ctx_id: u32, ring_idx: u8),
 }
 
 #[repr(C)]
@@ -161,12 +161,14 @@ extern "C" {
     ) -> c_int;
     fn stream_renderer_resource_unmap(res_handle: u32) -> c_int;
     fn stream_renderer_resource_map_info(res_handle: u32, map_info: *mut u32) -> c_int;
+    fn stream_renderer_context_create_fence(fence_id: u64, ctx_id: u32, ring_idx: u8) -> c_int;
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct Gfxstream {
     fence_state: Rc<RefCell<FenceState>>,
     fence_handler: RutabagaFenceHandler,
+    use_async_fence_cb: bool,
 }
 
 struct GfxstreamContext {
@@ -216,6 +218,15 @@ impl RutabagaContext for GfxstreamContext {
     fn component_type(&self) -> RutabagaComponentType {
         RutabagaComponentType::Gfxstream
     }
+
+    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // Safe becase only integers are given to gfxstream, not memory.
+        let ret = unsafe {
+            stream_renderer_context_create_fence(fence.fence_id, fence.ctx_id, fence.ring_idx)
+        };
+
+        ret_to_res(ret)
+    }
 }
 
 impl Drop for GfxstreamContext {
@@ -234,7 +245,7 @@ const GFXSTREAM_RENDERER_CALLBACKS: &VirglRendererCallbacks = &VirglRendererCall
     destroy_gl_context: None,
     make_current: None,
     get_drm_fd: None,
-    write_context_fence: None,
+    write_context_fence,
 };
 
 fn map_func(resource_id: u32) -> ExternalMappingResult<(u64, usize)> {
@@ -261,14 +272,16 @@ impl Gfxstream {
         gfxstream_flags: GfxstreamFlags,
         fence_handler: RutabagaFenceHandler,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
-        let fence_state = Rc::new(RefCell::new(FenceState {
-            latest_fence: 0,
-            handler: None,
-        }));
+        let fence_state = Rc::new(RefCell::new(FenceState { latest_fence: 0 }));
+
+        let use_async_fence_cb =
+            (u32::from(gfxstream_flags) & GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB) != 0;
 
         let cookie: *mut VirglCookie = Box::into_raw(Box::new(VirglCookie {
             fence_state: Rc::clone(&fence_state),
             render_server_fd: None,
+            fence_handler: None,
+            use_async_fence_cb,
         }));
 
         unsafe {
@@ -286,6 +299,7 @@ impl Gfxstream {
         Ok(Box::new(Gfxstream {
             fence_state,
             fence_handler,
+            use_async_fence_cb,
         }))
     }
 
@@ -325,9 +339,14 @@ impl RutabagaComponent for Gfxstream {
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
         let ret = unsafe { pipe_virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
-        // This can be moved to the cookie once gfxstream directly calls the
-        // write_fence callback in pipe_virgl_renderer_create_fence
-        self.fence_handler.call(fence);
+
+        // When async_fence_cb is enabled, gfxstream directly calls the write_fence callback in
+        // pipe_virgl_renderer_create_fence.
+        // TODO: this can be removed when timer-based fence handling is removed.
+        if !self.use_async_fence_cb {
+            self.fence_handler.call(fence);
+        }
+
         ret_to_res(ret)
     }
 

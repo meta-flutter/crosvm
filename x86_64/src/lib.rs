@@ -251,7 +251,7 @@ struct LowMemoryLayout {
 
 static LOW_MEMORY_LAYOUT: OnceCell<LowMemoryLayout> = OnceCell::new();
 
-fn init_low_memory_layout() {
+fn init_low_memory_layout(pcie_ecam: Option<MemRegion>) {
     LOW_MEMORY_LAYOUT.get_or_init(|| {
         // Make sure it align to 256MB for MTRR convenient
         const MEM_32BIT_GAP_SIZE: u64 = if cfg!(feature = "direct") {
@@ -270,11 +270,23 @@ fn init_low_memory_layout() {
         // Reserve 64MB for pcie enhanced configuration
         const PCIE_CFG_MMIO_SIZE: u64 = 0x400_0000;
 
+        let (pcie_cfg_mmio_start, pcie_cfg_mmio_size) = if let Some(pcie_mem) = pcie_ecam {
+            (pcie_mem.base, pcie_mem.size)
+        } else {
+            (
+                (FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE),
+                PCIE_CFG_MMIO_SIZE,
+            )
+        };
+
+        let pci_start = pcie_cfg_mmio_start.min(FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE);
+        let pci_size = FIRST_ADDR_PAST_32BITS - pci_start - RESERVED_MEM_SIZE;
+
         LowMemoryLayout {
-            pci_start: FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE,
-            pci_size: MEM_32BIT_GAP_SIZE - RESERVED_MEM_SIZE,
-            pcie_cfg_mmio_start: FIRST_ADDR_PAST_32BITS - RESERVED_MEM_SIZE - PCIE_CFG_MMIO_SIZE,
-            pcie_cfg_mmio_size: PCIE_CFG_MMIO_SIZE,
+            pci_start,
+            pci_size,
+            pcie_cfg_mmio_start,
+            pcie_cfg_mmio_size,
         }
     });
 }
@@ -447,12 +459,13 @@ impl arch::LinuxArch for X8664arch {
     fn guest_memory_layout(
         components: &VmComponents,
     ) -> std::result::Result<Vec<(GuestAddress, u64)>, Self::Error> {
-        init_low_memory_layout();
+        init_low_memory_layout(components.pcie_ecam);
 
         let bios_size = match &components.vm_image {
             VmImage::Bios(bios_file) => Some(bios_file.metadata().map_err(Error::LoadBios)?.len()),
             VmImage::Kernel(_) => None,
         };
+
         Ok(arch_memory_regions(components.memory_size, bios_size))
     }
 
@@ -604,7 +617,6 @@ impl arch::LinuxArch for X8664arch {
 
         // each bus occupy 1MB mmio for pcie enhanced configuration
         let max_bus = ((read_pcie_cfg_mmio_size() / 0x100000) - 1) as u8;
-
         let (acpi_dev_resource, bat_control) = Self::setup_acpi_devices(
             &mem,
             &io_bus,
@@ -1282,13 +1294,6 @@ impl X8664arch {
         reset_evt: Event,
         mem_size: u64,
     ) -> Result<()> {
-        struct NoDevice;
-        impl devices::BusDevice for NoDevice {
-            fn debug_label(&self) -> String {
-                "no device".to_owned()
-            }
-        }
-
         let mem_regions = arch_memory_regions(mem_size, None);
 
         let mem_below_4g = mem_regions
@@ -1311,7 +1316,6 @@ impl X8664arch {
             )
             .unwrap();
 
-        let nul_device = Arc::new(Mutex::new(NoDevice));
         let i8042 = Arc::new(Mutex::new(devices::I8042Device::new(
             reset_evt.try_clone().map_err(Error::CloneEvent)?,
         )));
@@ -1321,9 +1325,6 @@ impl X8664arch {
         } else {
             io_bus.insert(i8042, 0x061, 0x4).unwrap();
         }
-
-        io_bus.insert(nul_device.clone(), 0x0ed, 0x1).unwrap(); // most likely this one does nothing
-        io_bus.insert(nul_device, 0x0f0, 0x2).unwrap(); // ignore fpu
 
         Ok(())
     }
@@ -1676,7 +1677,11 @@ mod tests {
     const TEST_MEMORY_SIZE: u64 = 2 * GB;
 
     fn setup() {
-        init_low_memory_layout();
+        let pcie_ecam = Some(MemRegion {
+            base: 3 * GB,
+            size: 256 * MB,
+        });
+        init_low_memory_layout(pcie_ecam);
     }
 
     #[test]
@@ -1757,6 +1762,15 @@ mod tests {
             regions[1].0
         );
         assert_eq!(bios_len, regions[1].1);
+    }
+
+    #[test]
+    fn check_pci_mmio_layout() {
+        setup();
+
+        assert_eq!(read_pci_start_before_32bit(), 3 * GB);
+        assert_eq!(read_pcie_cfg_mmio_start(), 3 * GB);
+        assert_eq!(read_pcie_cfg_mmio_size(), 256 * MB);
     }
 
     #[test]

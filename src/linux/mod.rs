@@ -17,7 +17,6 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, Barrier};
-use std::time::Duration;
 
 use std::process;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -912,6 +911,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pvm_fw: pvm_fw_image,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         pcie_ecam: cfg.pcie_ecam,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        pci_low_start: cfg.pci_low_start,
     })
 }
 
@@ -1133,10 +1134,6 @@ where
             // Balloon gets a special socket so balloon requests can be forwarded
             // from the main process.
             let (host, device) = Tube::pair().context("failed to create tube")?;
-            // Set recv timeout to avoid deadlock on sending BalloonControlCommand
-            // before the guest is ready.
-            host.set_recv_timeout(Some(Duration::from_millis(100)))
-                .context("failed to set timeout")?;
             (Some(host), Some(device))
         }
     } else {
@@ -1280,13 +1277,6 @@ where
         direct_irq
             .irq_enable(*irq)
             .context("failed to enable interrupt forwarding")?;
-
-        if cfg.direct_wake_irq.contains(&irq) {
-            direct_irq
-                .irq_wake_enable(*irq)
-                .context("failed to enable interrupt wake")?;
-        }
-
         irqs.push(direct_irq);
     }
 
@@ -1302,13 +1292,6 @@ where
         direct_irq
             .irq_enable(*irq)
             .context("failed to enable interrupt forwarding")?;
-
-        if cfg.direct_wake_irq.contains(&irq) {
-            direct_irq
-                .irq_wake_enable(*irq)
-                .context("failed to enable interrupt wake")?;
-        }
-
         irqs.push(direct_irq);
     }
 

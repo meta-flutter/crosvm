@@ -22,7 +22,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use arch::{
-    set_default_serial_parameters, MsrAction, MsrConfig, MsrValueFrom, Pstore, VcpuAffinity,
+    set_default_serial_parameters, MsrAction, MsrConfig, MsrRWType, MsrValueFrom, Pstore,
+    VcpuAffinity,
 };
 use base::{debug, error, getpid, info, kill_process_group, pagesize, reap_child, syslog, warn};
 use crosvm::{
@@ -624,7 +625,9 @@ fn parse_ac97_options(s: &str) -> argument::Result<Ac97Parameters> {
 }
 
 fn parse_userspace_msr_options(value: &str) -> argument::Result<(u32, MsrConfig)> {
-    let mut msr_config = MsrConfig::new();
+    let mut rw_type: Option<MsrRWType> = None;
+    let mut action: Option<MsrAction> = None;
+    let mut from = MsrValueFrom::RWFromRunningCPU;
 
     let mut options = argument::parse_key_value_options("userspace-msr", value, ',');
     let index: u32 = options
@@ -637,42 +640,42 @@ fn parse_userspace_msr_options(value: &str) -> argument::Result<(u32, MsrConfig)
     for opt in options {
         match opt.key() {
             "type" => match opt.value()? {
-                "r" => msr_config.rw_type.read_allow = true,
-                "w" => msr_config.rw_type.write_allow = true,
-                "rw" | "wr" => {
-                    msr_config.rw_type.read_allow = true;
-                    msr_config.rw_type.write_allow = true;
-                }
+                "r" => rw_type = Some(MsrRWType::ReadOnly),
+                "w" => rw_type = Some(MsrRWType::WriteOnly),
+                "rw" | "wr" => rw_type = Some(MsrRWType::ReadWrite),
                 _ => {
                     return Err(opt.invalid_value_err(String::from("bad type")));
                 }
             },
             "action" => match opt.value()? {
-                "pass" => msr_config.action = Some(MsrAction::MsrPassthrough),
-                "emu" => msr_config.action = Some(MsrAction::MsrEmulate),
+                "pass" => action = Some(MsrAction::MsrPassthrough),
+                "emu" => action = Some(MsrAction::MsrEmulate),
                 _ => return Err(opt.invalid_value_err(String::from("bad action"))),
             },
             "from" => match opt.value()? {
-                "cpu0" => msr_config.from = MsrValueFrom::RWFromCPU0,
+                "cpu0" => from = MsrValueFrom::RWFromCPU0,
                 _ => return Err(opt.invalid_value_err(String::from("bad from"))),
             },
             _ => return Err(opt.invalid_key_err()),
         }
     }
 
-    if !msr_config.rw_type.read_allow && !msr_config.rw_type.write_allow {
-        return Err(argument::Error::ExpectedArgument(String::from(
-            "userspace-msr: type is required",
-        )));
-    }
+    let rw_type = rw_type.ok_or(argument::Error::ExpectedArgument(String::from(
+        "userspace-msr: type is required",
+    )))?;
 
-    if msr_config.action.is_none() {
-        return Err(argument::Error::ExpectedArgument(String::from(
-            "userspace-msr: action is required",
-        )));
-    }
+    let action = action.ok_or(argument::Error::ExpectedArgument(String::from(
+        "userspace-msr: action is required",
+    )))?;
 
-    Ok((index, msr_config))
+    Ok((
+        index,
+        MsrConfig {
+            rw_type,
+            action,
+            from,
+        },
+    ))
 }
 
 fn parse_serial_options(s: &str) -> argument::Result<SerialParameters> {
@@ -1816,21 +1819,6 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
                 );
         }
         #[cfg(feature = "direct")]
-        "direct-wake-irq" => {
-            cfg.direct_wake_irq
-                .push(
-                    value
-                        .unwrap()
-                        .parse()
-                        .map_err(|_| argument::Error::InvalidValue {
-                            value: value.unwrap().to_owned(),
-                            expected: String::from(
-                                "this value for `direct-wake-irq` must be an unsigned integer",
-                            ),
-                        })?,
-                );
-        }
-        #[cfg(feature = "direct")]
         "direct-gpe" => {
             cfg.direct_gpe.push(value.unwrap().parse().map_err(|_| {
                 argument::Error::InvalidValue {
@@ -2106,6 +2094,28 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
             }
 
             cfg.pcie_ecam = Some(MemRegion { base, size: len });
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "pci-start" => {
+            if cfg.pci_low_start.is_some() {
+                return Err(argument::Error::TooManyArguments(
+                    "`pci-start` already given".to_owned(),
+                ));
+            }
+
+            let value = value.unwrap();
+            let start = parse_hex_or_decimal(value).map_err(|_| argument::Error::InvalidValue {
+                value: value.to_owned(),
+                expected: String::from("pci-start parameter should be integer"),
+            })?;
+            // pci-start should be below 4G and aligned to 256MB
+            if start >= 0x1_0000_0000 || start & 0xFFF_FFFF != 0 {
+                return Err(argument::Error::InvalidValue {
+                    value: value.to_owned(),
+                    expected: String::from("pci-start should be below 4G and alignment to 256MB"),
+                });
+            }
+            cfg.pci_low_start = Some(start);
         }
         "help" => return Err(argument::Error::PrintHelp),
         _ => sys::set_arguments(cfg, name, value)?,
@@ -2546,8 +2556,6 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
 #[cfg(feature = "direct")]
           Argument::value("direct-edge-irq", "irq", "Enable interrupt passthrough"),
 #[cfg(feature = "direct")]
-          Argument::value("direct-wake-irq", "irq", "Enable wakeup interrupt for host"),
-#[cfg(feature = "direct")]
           Argument::value("direct-gpe", "gpe", "Enable GPE interrupt and register access passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
           Argument::flag("no-legacy", "Don't use legacy KBD/RTC devices emulation"),
@@ -2613,6 +2621,8 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::value("pcie-ecam", "mmio_base,mmio_length",
                           "Base and length for PCIE Enhanced Configuration Access Mechanism"),
+          #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+          Argument::value("pci-start", "pci_low_mmio_start", "the pci mmio start address below 4G"),
           Argument::short_flag('h', "help", "Print help message.")];
 
     arguments.append(&mut sys::get_arguments());
@@ -2919,11 +2929,18 @@ fn create_composite(mut args: std::env::Args) -> std::result::Result<(), ()> {
             if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
                 let partition_file = File::open(path)
                     .map_err(|e| error!("Failed to open partition image: {}", e))?;
-                let size =
-                    create_disk_file(partition_file, disk::MAX_NESTING_DEPTH, Path::new(path))
-                        .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
-                        .get_len()
-                        .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
+
+                // Sparseness for composite disks is not user provided on Linux
+                // (e.g. via an option), and it has no runtime effect.
+                let size = create_disk_file(
+                    partition_file,
+                    /* is_sparse_file= */ true,
+                    disk::MAX_NESTING_DEPTH,
+                    Path::new(path),
+                )
+                .map_err(|e| error!("Failed to create DiskFile instance: {}", e))?
+                .get_len()
+                .map_err(|e| error!("Failed to get length of partition image: {}", e))?;
                 Ok(PartitionInfo {
                     label: label.to_owned(),
                     path: Path::new(path).to_owned(),
@@ -4123,23 +4140,15 @@ mod tests {
         let (pass_cpu0_index, pass_cpu0_cfg) =
             parse_userspace_msr_options("0x10,type=r,action=pass,from=cpu0").unwrap();
         assert_eq!(pass_cpu0_index, 0x10);
-        assert!(pass_cpu0_cfg.rw_type.read_allow);
-        assert!(!pass_cpu0_cfg.rw_type.write_allow);
-        assert_eq!(
-            *pass_cpu0_cfg.action.as_ref().unwrap(),
-            MsrAction::MsrPassthrough
-        );
+        assert_eq!(pass_cpu0_cfg.rw_type, MsrRWType::ReadOnly);
+        assert_eq!(pass_cpu0_cfg.action, MsrAction::MsrPassthrough);
         assert_eq!(pass_cpu0_cfg.from, MsrValueFrom::RWFromCPU0);
 
         let (pass_cpus_index, pass_cpus_cfg) =
             parse_userspace_msr_options("0x10,type=rw,action=emu").unwrap();
         assert_eq!(pass_cpus_index, 0x10);
-        assert!(pass_cpus_cfg.rw_type.read_allow);
-        assert!(pass_cpus_cfg.rw_type.write_allow);
-        assert_eq!(
-            *pass_cpus_cfg.action.as_ref().unwrap(),
-            MsrAction::MsrEmulate
-        );
+        assert_eq!(pass_cpus_cfg.rw_type, MsrRWType::ReadWrite);
+        assert_eq!(pass_cpus_cfg.action, MsrAction::MsrEmulate);
         assert_eq!(pass_cpus_cfg.from, MsrValueFrom::RWFromRunningCPU);
 
         assert!(parse_userspace_msr_options("0x10,action=none").is_err());

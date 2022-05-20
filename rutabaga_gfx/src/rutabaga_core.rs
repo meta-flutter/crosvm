@@ -193,7 +193,7 @@ pub trait RutabagaContext {
     fn detach(&mut self, _resource: &RutabagaResource);
 
     /// Implementations must create a fence on specified `ring_idx` in `fence`.  This
-    /// allows for multiple syncrhonizations timelines per RutabagaContext.
+    /// allows for multiple synchronizations timelines per RutabagaContext.
     fn context_create_fence(&mut self, _fence: RutabagaFence) -> RutabagaResult<()> {
         Err(RutabagaError::Unsupported)
     }
@@ -870,11 +870,6 @@ impl RutabagaBuilder {
 
             let cross_domain = CrossDomain::init(self.channels)?;
             rutabaga_components.insert(RutabagaComponentType::CrossDomain, cross_domain);
-
-            rutabaga_capsets.push(RutabagaCapsetInfo {
-                capset_id: RUTABAGA_CAPSET_CROSS_DOMAIN,
-                component: RutabagaComponentType::CrossDomain,
-            });
         }
 
         Ok(Rutabaga {

@@ -72,7 +72,7 @@ use devices::{
     BusDeviceObj, BusResumeDevice, IrqChip, IrqChipX86_64, PciAddress, PciConfigIo, PciConfigMmio,
     PciDevice, PciVirtualConfigMmio,
 };
-use hypervisor::{HypervisorX86_64, ProtectionType, VcpuX86_64, Vm, VmX86_64};
+use hypervisor::{HypervisorX86_64, ProtectionType, VcpuX86_64, Vm, VmCap, VmX86_64};
 use minijail::Minijail;
 use remain::sorted;
 use resources::{MemRegion, SystemAllocator, SystemAllocatorConfig};
@@ -251,7 +251,7 @@ struct LowMemoryLayout {
 
 static LOW_MEMORY_LAYOUT: OnceCell<LowMemoryLayout> = OnceCell::new();
 
-fn init_low_memory_layout(pcie_ecam: Option<MemRegion>) {
+fn init_low_memory_layout(pcie_ecam: Option<MemRegion>, pci_low_start: Option<u64>) {
     LOW_MEMORY_LAYOUT.get_or_init(|| {
         // Make sure it align to 256MB for MTRR convenient
         const MEM_32BIT_GAP_SIZE: u64 = if cfg!(feature = "direct") {
@@ -279,7 +279,12 @@ fn init_low_memory_layout(pcie_ecam: Option<MemRegion>) {
             )
         };
 
-        let pci_start = pcie_cfg_mmio_start.min(FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE);
+        let pci_start = if let Some(pci_low) = pci_low_start {
+            pcie_cfg_mmio_start.min(pci_low)
+        } else {
+            pcie_cfg_mmio_start.min(FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE)
+        };
+
         let pci_size = FIRST_ADDR_PAST_32BITS - pci_start - RESERVED_MEM_SIZE;
 
         LowMemoryLayout {
@@ -459,7 +464,7 @@ impl arch::LinuxArch for X8664arch {
     fn guest_memory_layout(
         components: &VmComponents,
     ) -> std::result::Result<Vec<(GuestAddress, u64)>, Self::Error> {
-        init_low_memory_layout(components.pcie_ecam);
+        init_low_memory_layout(components.pcie_ecam, components.pci_low_start);
 
         let bios_size = match &components.vm_image {
             VmImage::Bios(bios_file) => Some(bios_file.metadata().map_err(Error::LoadBios)?.len()),
@@ -757,17 +762,19 @@ impl arch::LinuxArch for X8664arch {
         host_cpu_topology: bool,
         itmt: bool,
     ) -> Result<()> {
-        cpuid::setup_cpuid(
-            hypervisor,
-            irq_chip,
-            vcpu,
-            vcpu_id,
-            num_cpus,
-            no_smt,
-            host_cpu_topology,
-            itmt,
-        )
-        .map_err(Error::SetupCpuid)?;
+        if !vm.check_capability(VmCap::EarlyInitCpuid) {
+            cpuid::setup_cpuid(
+                hypervisor,
+                irq_chip,
+                vcpu,
+                vcpu_id,
+                num_cpus,
+                no_smt,
+                host_cpu_topology,
+                itmt,
+            )
+            .map_err(Error::SetupCpuid)?;
+        }
 
         if has_bios {
             return Ok(());
@@ -1557,12 +1564,24 @@ fn check_itmt_cpu_support() -> std::result::Result<(), ItmtError> {
     }
 }
 
-fn insert_msr_map(
+fn insert_msr(
     msr_map: &mut BTreeMap<u32, MsrConfig>,
     key: u32,
-    value: MsrConfig,
+    rw_type: MsrRWType,
+    action: MsrAction,
+    from: MsrValueFrom,
 ) -> std::result::Result<(), ItmtError> {
-    if msr_map.insert(key, value).is_some() {
+    if msr_map
+        .insert(
+            key,
+            MsrConfig {
+                rw_type,
+                action,
+                from,
+            },
+        )
+        .is_some()
+    {
         Err(ItmtError::MsrDuplicate(key))
     } else {
         Ok(())
@@ -1574,83 +1593,47 @@ pub fn set_itmt_msr_config(
 ) -> std::result::Result<(), ItmtError> {
     check_itmt_cpu_support()?;
 
-    insert_msr_map(
-        msr_map,
-        MSR_HWP_CAPABILITIES,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: false,
-            },
-            action: Some(MsrAction::MsrPassthrough),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
-
-    insert_msr_map(
-        msr_map,
-        MSR_PM_ENABLE,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: true,
-            },
-            action: Some(MsrAction::MsrEmulate),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
-
-    insert_msr_map(
-        msr_map,
-        MSR_HWP_REQUEST,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: true,
-            },
-            action: Some(MsrAction::MsrEmulate),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
-
-    insert_msr_map(
-        msr_map,
-        MSR_TURBO_RATIO_LIMIT,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: false,
-            },
-            action: Some(MsrAction::MsrPassthrough),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
-
-    insert_msr_map(
-        msr_map,
-        MSR_PLATFORM_INFO,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: false,
-            },
-            action: Some(MsrAction::MsrPassthrough),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
-
-    insert_msr_map(
-        msr_map,
-        MSR_IA32_PERF_CTL,
-        MsrConfig {
-            rw_type: MsrRWType {
-                read_allow: true,
-                write_allow: true,
-            },
-            action: Some(MsrAction::MsrEmulate),
-            from: MsrValueFrom::RWFromRunningCPU,
-        },
-    )?;
+    let msrs = vec![
+        (
+            MSR_HWP_CAPABILITIES,
+            MsrRWType::ReadOnly,
+            MsrAction::MsrPassthrough,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+        (
+            MSR_PM_ENABLE,
+            MsrRWType::ReadWrite,
+            MsrAction::MsrEmulate,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+        (
+            MSR_HWP_REQUEST,
+            MsrRWType::ReadWrite,
+            MsrAction::MsrEmulate,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+        (
+            MSR_TURBO_RATIO_LIMIT,
+            MsrRWType::ReadOnly,
+            MsrAction::MsrPassthrough,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+        (
+            MSR_PLATFORM_INFO,
+            MsrRWType::ReadOnly,
+            MsrAction::MsrPassthrough,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+        (
+            MSR_IA32_PERF_CTL,
+            MsrRWType::ReadWrite,
+            MsrAction::MsrEmulate,
+            MsrValueFrom::RWFromRunningCPU,
+        ),
+    ];
+    for msr in msrs {
+        insert_msr(msr_map, msr.0, msr.1, msr.2, msr.3)?;
+    }
 
     Ok(())
 }
@@ -1669,7 +1652,8 @@ mod tests {
             base: 3 * GB,
             size: 256 * MB,
         });
-        init_low_memory_layout(pcie_ecam);
+        let pci_start = Some(2 * GB);
+        init_low_memory_layout(pcie_ecam, pci_start);
     }
 
     #[test]
@@ -1756,7 +1740,7 @@ mod tests {
     fn check_pci_mmio_layout() {
         setup();
 
-        assert_eq!(read_pci_start_before_32bit(), 3 * GB);
+        assert_eq!(read_pci_start_before_32bit(), 2 * GB);
         assert_eq!(read_pcie_cfg_mmio_start(), 3 * GB);
         assert_eq!(read_pcie_cfg_mmio_size(), 256 * MB);
     }

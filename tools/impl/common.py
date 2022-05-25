@@ -126,7 +126,7 @@ class Command(object):
         self.env_vars = env_vars
         if len(self.args) > 0:
             executable = self.args[0]
-            if Path(executable).exists:
+            if Path(executable).exists():
                 self.executable = Path(executable)
             else:
                 path = shutil.which(executable)
@@ -526,11 +526,15 @@ def __add_verbose_args(parser: argparse.ArgumentParser):
     )
 
 
+def all_tracked_files():
+    return (Path(f) for f in cmd("git ls-files").lines())
+
+
 def find_source_files(extension: str, ignore: List[str] = []):
-    for file in Path(".").glob(f"**/*.{extension}"):
-        if file.is_relative_to("third_party"):
+    for file in all_tracked_files():
+        if file.suffix != f".{extension}":
             continue
-        if "target" in file.parts:
+        if file.is_relative_to("third_party"):
             continue
         if str(file) in ignore:
             continue

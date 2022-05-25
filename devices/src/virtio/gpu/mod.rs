@@ -97,6 +97,7 @@ pub struct GpuParameters {
     pub mode: GpuMode,
     pub cache_path: Option<String>,
     pub cache_size: Option<String>,
+    pub context_mask: u64,
 }
 
 // First queue is for virtio gpu commands. Second queue is for cursor commands, which we expect
@@ -127,6 +128,7 @@ impl Default for GpuParameters {
             cache_path: None,
             cache_size: None,
             udmabuf: false,
+            context_mask: 0,
         }
     }
 }
@@ -1019,6 +1021,7 @@ pub struct Gpu {
     base_features: u64,
     udmabuf: bool,
     render_server_fd: Option<SafeDescriptor>,
+    context_mask: u64,
 }
 
 impl Gpu {
@@ -1035,24 +1038,6 @@ impl Gpu {
         base_features: u64,
         channels: BTreeMap<String, PathBuf>,
     ) -> Gpu {
-        let virglrenderer_flags = VirglRendererFlags::new()
-            .use_egl(gpu_parameters.renderer_use_egl)
-            .use_gles(gpu_parameters.renderer_use_gles)
-            .use_glx(gpu_parameters.renderer_use_glx)
-            .use_surfaceless(gpu_parameters.renderer_use_surfaceless)
-            .use_external_blob(external_blob)
-            .use_venus(gpu_parameters.use_vulkan)
-            .use_render_server(render_server_fd.is_some());
-        let gfxstream_flags = GfxstreamFlags::new()
-            .use_egl(gpu_parameters.renderer_use_egl)
-            .use_gles(gpu_parameters.renderer_use_gles)
-            .use_glx(gpu_parameters.renderer_use_glx)
-            .use_surfaceless(gpu_parameters.renderer_use_surfaceless)
-            .use_guest_angle(gpu_parameters.gfxstream_use_guest_angle)
-            .use_syncfd(gpu_parameters.gfxstream_use_syncfd)
-            .use_vulkan(gpu_parameters.use_vulkan)
-            .use_async_fence_cb(true);
-
         let mut rutabaga_channels: Vec<RutabagaChannel> = Vec::new();
         for (channel_name, path) in &channels {
             match &channel_name[..] {
@@ -1082,12 +1067,19 @@ impl Gpu {
             display_height = gpu_parameters.displays[0].height;
         }
 
-        let rutabaga_builder = RutabagaBuilder::new(component)
+        let rutabaga_builder = RutabagaBuilder::new(component, gpu_parameters.context_mask)
             .set_display_width(display_width)
             .set_display_height(display_height)
-            .set_virglrenderer_flags(virglrenderer_flags)
-            .set_gfxstream_flags(gfxstream_flags)
-            .set_rutabaga_channels(rutabaga_channels_opt);
+            .set_rutabaga_channels(rutabaga_channels_opt)
+            .set_use_egl(gpu_parameters.renderer_use_egl)
+            .set_use_gles(gpu_parameters.renderer_use_gles)
+            .set_use_glx(gpu_parameters.renderer_use_glx)
+            .set_use_surfaceless(gpu_parameters.renderer_use_surfaceless)
+            .set_use_vulkan(gpu_parameters.use_vulkan)
+            .set_use_syncfd(gpu_parameters.gfxstream_use_syncfd)
+            .set_use_guest_angle(gpu_parameters.gfxstream_use_guest_angle)
+            .set_use_external_blob(external_blob)
+            .set_use_render_server(render_server_fd.is_some());
 
         Gpu {
             exit_evt_wrtube,
@@ -1107,6 +1099,7 @@ impl Gpu {
             base_features,
             udmabuf: gpu_parameters.udmabuf,
             render_server_fd,
+            context_mask: gpu_parameters.context_mask,
         }
     }
 
@@ -1154,25 +1147,30 @@ impl Gpu {
             events_read |= VIRTIO_GPU_EVENT_DISPLAY;
         }
 
-        let num_capsets = match self.rutabaga_component {
-            RutabagaComponentType::Rutabaga2D => 0,
-            _ => {
-                let mut num_capsets = 0;
+        let num_capsets = match self.context_mask {
+            0 => {
+                match self.rutabaga_component {
+                    RutabagaComponentType::Rutabaga2D => 0,
+                    _ => {
+                        let mut num_capsets = 0;
 
-                // Three capsets for virgl_renderer
-                #[cfg(feature = "virgl_renderer")]
-                {
-                    num_capsets += 3;
+                        // Three capsets for virgl_renderer
+                        #[cfg(feature = "virgl_renderer")]
+                        {
+                            num_capsets += 3;
+                        }
+
+                        // One capset for gfxstream
+                        #[cfg(feature = "gfxstream")]
+                        {
+                            num_capsets += 1;
+                        }
+
+                        num_capsets
+                    }
                 }
-
-                // One capset for gfxstream
-                #[cfg(feature = "gfxstream")]
-                {
-                    num_capsets += 1;
-                }
-
-                num_capsets
             }
+            _ => self.context_mask.count_ones(),
         };
 
         virtio_gpu_config {

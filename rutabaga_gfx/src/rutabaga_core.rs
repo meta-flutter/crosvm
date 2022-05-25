@@ -215,7 +215,41 @@ pub trait RutabagaContext {
 struct RutabagaCapsetInfo {
     pub capset_id: u32,
     pub component: RutabagaComponentType,
+    pub _name: &'static str,
 }
+
+const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 6] = [
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_VIRGL,
+        component: RutabagaComponentType::VirglRenderer,
+        _name: "virgl",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_VIRGL2,
+        component: RutabagaComponentType::VirglRenderer,
+        _name: "virgl2",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_GFXSTREAM,
+        component: RutabagaComponentType::Gfxstream,
+        _name: "gfxstream",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_VENUS,
+        component: RutabagaComponentType::VirglRenderer,
+        _name: "venus",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_CROSS_DOMAIN,
+        component: RutabagaComponentType::CrossDomain,
+        _name: "cross-domain",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_DRM,
+        component: RutabagaComponentType::VirglRenderer,
+        _name: "drm",
+    },
+];
 
 /// The global libary handle used to query capability sets, create resources and contexts.
 ///
@@ -702,20 +736,25 @@ pub struct RutabagaBuilder {
     display_width: Option<u32>,
     display_height: Option<u32>,
     default_component: RutabagaComponentType,
-    virglrenderer_flags: Option<VirglRendererFlags>,
-    gfxstream_flags: Option<GfxstreamFlags>,
+    gfxstream_flags: GfxstreamFlags,
+    virglrenderer_flags: VirglRendererFlags,
+    context_mask: u64,
     channels: Option<Vec<RutabagaChannel>>,
 }
 
 impl RutabagaBuilder {
     /// Create new a RutabagaBuilder.
-    pub fn new(default_component: RutabagaComponentType) -> RutabagaBuilder {
+    pub fn new(default_component: RutabagaComponentType, context_mask: u64) -> RutabagaBuilder {
+        let virglrenderer_flags = VirglRendererFlags::new();
+        let gfxstream_flags = GfxstreamFlags::new().use_async_fence_cb(true);
+
         RutabagaBuilder {
             display_width: None,
             display_height: None,
             default_component,
-            virglrenderer_flags: None,
-            gfxstream_flags: None,
+            gfxstream_flags,
+            virglrenderer_flags,
+            context_mask,
             channels: None,
         }
     }
@@ -732,18 +771,62 @@ impl RutabagaBuilder {
         self
     }
 
-    /// Set virglrenderer flags for the RutabagaBuilder
-    pub fn set_virglrenderer_flags(
-        mut self,
-        virglrenderer_flags: VirglRendererFlags,
-    ) -> RutabagaBuilder {
-        self.virglrenderer_flags = Some(virglrenderer_flags);
+    /// Sets use EGL flags in gfxstream + virglrenderer.
+    pub fn set_use_egl(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_egl(v);
+        self.virglrenderer_flags = self.virglrenderer_flags.use_egl(v);
         self
     }
 
-    /// Set gfxstream flags for the RutabagaBuilder
-    pub fn set_gfxstream_flags(mut self, gfxstream_flags: GfxstreamFlags) -> RutabagaBuilder {
-        self.gfxstream_flags = Some(gfxstream_flags);
+    /// Sets use GLES in gfxstream + virglrenderer.
+    pub fn set_use_gles(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_gles(v);
+        self.virglrenderer_flags = self.virglrenderer_flags.use_gles(v);
+        self
+    }
+
+    /// Sets use GLX flags in gfxstream + virglrenderer.
+    pub fn set_use_glx(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_glx(v);
+        self.virglrenderer_flags = self.virglrenderer_flags.use_glx(v);
+        self
+    }
+
+    /// Sets use surfaceless flags in gfxstream + virglrenderer.
+    pub fn set_use_surfaceless(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_surfaceless(v);
+        self.virglrenderer_flags = self.virglrenderer_flags.use_surfaceless(v);
+        self
+    }
+
+    /// Sets use Vulkan in gfxstream + virglrenderer.
+    pub fn set_use_vulkan(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_vulkan(v);
+        self.virglrenderer_flags = self.virglrenderer_flags.use_venus(v);
+        self
+    }
+
+    /// Set use syncfd in gfxstream
+    pub fn set_use_syncfd(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_syncfd(v);
+        self
+    }
+
+    /// Set use guest ANGLE in gfxstream
+    pub fn set_use_guest_angle(mut self, v: bool) -> RutabagaBuilder {
+        self.gfxstream_flags = self.gfxstream_flags.use_guest_angle(v);
+        self
+    }
+
+    /// Sets use external blob in virglrenderer.
+    pub fn set_use_external_blob(mut self, v: bool) -> RutabagaBuilder {
+        self.virglrenderer_flags = self.virglrenderer_flags.use_external_blob(v);
+        self
+    }
+
+    /// Sets use render server in virglrenderer.
+    pub fn set_use_render_server(mut self, v: bool) -> RutabagaBuilder {
+        self.virglrenderer_flags = self.virglrenderer_flags.use_render_server(v);
         self
     }
 
@@ -762,14 +845,57 @@ impl RutabagaBuilder {
     /// intialize all 3D components which have been built. In 2D mode, only the 2D component is
     /// initialized.
     pub fn build(
-        self,
+        mut self,
         fence_handler: RutabagaFenceHandler,
         render_server_fd: Option<SafeDescriptor>,
     ) -> RutabagaResult<Rutabaga> {
         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
             Default::default();
 
+        #[allow(unused_mut)]
         let mut rutabaga_capsets: Vec<RutabagaCapsetInfo> = Default::default();
+
+        let capset_enabled =
+            |capset_id: u32| -> bool { (self.context_mask & (1 << capset_id)) != 0 };
+
+        let mut push_capset = |capset_id: u32| {
+            if let Some(capset) = RUTABAGA_CAPSETS
+                .iter()
+                .find(|capset| capset_id == capset.capset_id)
+            {
+                if self.context_mask != 0 {
+                    if capset_enabled(capset.capset_id) {
+                        rutabaga_capsets.push(*capset);
+                    }
+                } else {
+                    // Unconditionally push capset -- this should eventually be deleted when context types are
+                    // always specified by crosvm launchers.
+                    rutabaga_capsets.push(*capset);
+                }
+            };
+        };
+
+        if self.context_mask != 0 {
+            let supports_gfxstream = capset_enabled(RUTABAGA_CAPSET_GFXSTREAM);
+            let supports_virglrenderer = capset_enabled(RUTABAGA_CAPSET_VIRGL2)
+                | capset_enabled(RUTABAGA_CAPSET_VENUS)
+                | capset_enabled(RUTABAGA_CAPSET_DRM);
+
+            if supports_gfxstream {
+                self.default_component = RutabagaComponentType::Gfxstream;
+            } else if supports_virglrenderer {
+                self.default_component = RutabagaComponentType::VirglRenderer;
+            } else {
+                self.default_component = RutabagaComponentType::CrossDomain;
+            }
+
+            self.virglrenderer_flags = self
+                .virglrenderer_flags
+                .use_virgl(capset_enabled(RUTABAGA_CAPSET_VIRGL2))
+                .use_venus(capset_enabled(RUTABAGA_CAPSET_VENUS))
+                .use_async_fence_cb(capset_enabled(RUTABAGA_CAPSET_DRM))
+                .use_drm(capset_enabled(RUTABAGA_CAPSET_DRM));
+        }
 
         // Make sure that disabled components are not used as default.
         #[cfg(not(feature = "virgl_renderer"))]
@@ -804,35 +930,21 @@ impl RutabagaBuilder {
         } else {
             #[cfg(feature = "virgl_renderer")]
             if self.default_component == RutabagaComponentType::VirglRenderer {
-                let virglrenderer_flags =
-                    self.virglrenderer_flags
-                        .ok_or(RutabagaError::InvalidRutabagaBuild(
-                            "missing virgl renderer flags",
-                        ))?;
-
-                if (u32::from(virglrenderer_flags) & VIRGLRENDERER_USE_ASYNC_FENCE_CB) == 0 {
+                if (u32::from(self.virglrenderer_flags) & VIRGLRENDERER_USE_ASYNC_FENCE_CB) == 0 {
                     use_timer_based_fence_polling = true;
                 }
 
                 let virgl = VirglRenderer::init(
-                    virglrenderer_flags,
+                    self.virglrenderer_flags,
                     fence_handler.clone(),
                     render_server_fd,
                 )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
-                rutabaga_capsets.push(RutabagaCapsetInfo {
-                    capset_id: RUTABAGA_CAPSET_VIRGL,
-                    component: RutabagaComponentType::VirglRenderer,
-                });
-                rutabaga_capsets.push(RutabagaCapsetInfo {
-                    capset_id: RUTABAGA_CAPSET_VIRGL2,
-                    component: RutabagaComponentType::VirglRenderer,
-                });
-                rutabaga_capsets.push(RutabagaCapsetInfo {
-                    capset_id: RUTABAGA_CAPSET_VENUS,
-                    component: RutabagaComponentType::VirglRenderer,
-                });
+                push_capset(RUTABAGA_CAPSET_VIRGL);
+                push_capset(RUTABAGA_CAPSET_VIRGL2);
+                push_capset(RUTABAGA_CAPSET_VENUS);
+                push_capset(RUTABAGA_CAPSET_DRM);
             }
 
             #[cfg(feature = "gfxstream")]
@@ -846,33 +958,26 @@ impl RutabagaBuilder {
                             "missing display height",
                         ))?;
 
-                let gfxstream_flags =
-                    self.gfxstream_flags
-                        .ok_or(RutabagaError::InvalidRutabagaBuild(
-                            "missing gfxstream flags",
-                        ))?;
-
                 let gfxstream = Gfxstream::init(
                     display_width,
                     display_height,
-                    gfxstream_flags,
+                    self.gfxstream_flags,
                     fence_handler.clone(),
                 )?;
 
-                if (u32::from(gfxstream_flags) & GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB) == 0 {
+                if (u32::from(self.gfxstream_flags) & GFXSTREAM_RENDERER_FLAGS_ASYNC_FENCE_CB) == 0
+                {
                     use_timer_based_fence_polling = true;
                 }
 
                 rutabaga_components.insert(RutabagaComponentType::Gfxstream, gfxstream);
 
-                rutabaga_capsets.push(RutabagaCapsetInfo {
-                    capset_id: RUTABAGA_CAPSET_GFXSTREAM,
-                    component: RutabagaComponentType::Gfxstream,
-                });
+                push_capset(RUTABAGA_CAPSET_GFXSTREAM);
             }
 
             let cross_domain = CrossDomain::init(self.channels)?;
             rutabaga_components.insert(RutabagaComponentType::CrossDomain, cross_domain);
+            push_capset(RUTABAGA_CAPSET_CROSS_DOMAIN);
         }
 
         Ok(Rutabaga {

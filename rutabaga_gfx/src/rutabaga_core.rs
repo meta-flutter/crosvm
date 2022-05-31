@@ -215,41 +215,64 @@ pub trait RutabagaContext {
 struct RutabagaCapsetInfo {
     pub capset_id: u32,
     pub component: RutabagaComponentType,
-    pub _name: &'static str,
+    pub name: &'static str,
 }
 
-const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 6] = [
+const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 7] = [
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_VIRGL,
         component: RutabagaComponentType::VirglRenderer,
-        _name: "virgl",
+        name: "virgl",
     },
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_VIRGL2,
         component: RutabagaComponentType::VirglRenderer,
-        _name: "virgl2",
+        name: "virgl2",
     },
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_GFXSTREAM,
         component: RutabagaComponentType::Gfxstream,
-        _name: "gfxstream",
+        name: "gfxstream",
     },
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_VENUS,
         component: RutabagaComponentType::VirglRenderer,
-        _name: "venus",
+        name: "venus",
     },
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_CROSS_DOMAIN,
         component: RutabagaComponentType::CrossDomain,
-        _name: "cross-domain",
+        name: "cross-domain",
+    },
+    RutabagaCapsetInfo {
+        capset_id: 30,
+        component: RutabagaComponentType::CrossDomain,
+        name: "minigbm-cross-domain",
     },
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_DRM,
         component: RutabagaComponentType::VirglRenderer,
-        _name: "drm",
+        name: "drm",
     },
 ];
+
+pub fn calculate_context_mask(context_names: Vec<String>) -> u64 {
+    let mut context_mask = 0;
+    context_names.into_iter().for_each(|name| {
+        if let Some(capset) = RUTABAGA_CAPSETS.iter().find(|capset| capset.name == name) {
+            context_mask |= 1 << capset.capset_id;
+        };
+    });
+
+    // TODO remove once
+    // https://android-review.googlesource.com/c/platform/external/minigbm/+/2101455
+    // is picked back to rvc-arc branch:
+    if context_mask & (1 << RUTABAGA_CAPSET_DRM) != 0 {
+        context_mask |= 1 << 30;
+    }
+
+    context_mask
+}
 
 /// The global libary handle used to query capability sets, create resources and contexts.
 ///
@@ -978,6 +1001,7 @@ impl RutabagaBuilder {
             let cross_domain = CrossDomain::init(self.channels)?;
             rutabaga_components.insert(RutabagaComponentType::CrossDomain, cross_domain);
             push_capset(RUTABAGA_CAPSET_CROSS_DOMAIN);
+            push_capset(30);
         }
 
         Ok(Rutabaga {

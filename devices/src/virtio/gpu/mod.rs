@@ -54,8 +54,7 @@ pub use self::protocol::{
 use self::virtio_gpu::VirtioGpu;
 
 use crate::pci::{
-    PciAddress, PciBarConfiguration, PciBarIndex, PciBarPrefetchable, PciBarRegionType,
-    PciCapability,
+    PciAddress, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
 };
 
 pub const DEFAULT_DISPLAY_WIDTH: u32 = 1280;
@@ -106,7 +105,7 @@ pub struct GpuParameters {
 pub const QUEUE_SIZES: &[u16] = &[256, 16];
 pub const FENCE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-pub const GPU_BAR_NUM: PciBarIndex = PciBarIndex::Bar4;
+pub const GPU_BAR_NUM: u8 = 4;
 pub const GPU_BAR_OFFSET: u64 = 0;
 pub const GPU_BAR_SIZE: u64 = 1 << 33;
 
@@ -1378,10 +1377,10 @@ impl VirtioDevice for Gpu {
             bus: address.bus,
             dev: address.dev,
             func: address.func,
-            bar: GPU_BAR_NUM.into(),
+            bar: GPU_BAR_NUM,
         });
         vec![PciBarConfiguration::new(
-            GPU_BAR_NUM,
+            GPU_BAR_NUM as usize,
             GPU_BAR_SIZE,
             PciBarRegionType::Memory64BitRegion,
             PciBarPrefetchable::NotPrefetchable,

@@ -605,7 +605,7 @@ impl WlVfd {
     fn allocate(vm: VmRequester, size: u64) -> WlResult<WlVfd> {
         let size_page_aligned = round_up_to_page_size(size as usize) as u64;
         let vfd_shm =
-            SharedMemory::named("virtwl_alloc", size_page_aligned).map_err(WlError::NewAlloc)?;
+            SharedMemory::new("virtwl_alloc", size_page_aligned).map_err(WlError::NewAlloc)?;
 
         let (vfd_shm, register_response) = vm.register_memory(vfd_shm)?;
 
@@ -1492,7 +1492,7 @@ impl WlState {
     }
 }
 
-#[derive(ThisError, Debug)]
+#[derive(ThisError, Debug, PartialEq)]
 #[error("no descriptors available in queue")]
 pub struct DescriptorsExhausted;
 

@@ -158,14 +158,19 @@ struct Worker {
 }
 
 impl Worker {
-    // Remove the endpoint from the endpoint_map and decrement the reference
-    // counter (or remove the entry if the ref count is 1) from domain_map.
-    // Returns true on success, and false if the endpoint can't be detached.
+    // Detach the given endpoint if possible, and return whether or not the endpoint
+    // was actually detached.
+    //
+    // The device MUST ensure that after being detached from a domain, the endpoint
+    // cannot access any mapping from that domain.
+    //
+    // Currently, we only support detaching an endpoint if it is the only endpoint attached
+    // to its domain.
     fn detach_endpoint(&mut self, endpoint: u32) -> bool {
         // The endpoint has attached to an IOMMU domain
         if let Some(attached_domain) = self.endpoint_map.get(&endpoint) {
             // Remove the entry or update the domain reference count
-            if let Entry::Occupied(mut o) = self.domain_map.entry(*attached_domain) {
+            if let Entry::Occupied(o) = self.domain_map.entry(*attached_domain) {
                 let (refs, mapper) = o.get();
                 if !mapper.lock().supports_detach() {
                     return false;
@@ -177,9 +182,7 @@ impl Worker {
                         mapper.lock().reset_domain();
                         o.remove();
                     }
-                    _ => {
-                        *o.get_mut() = (refs - 1, mapper.clone());
-                    }
+                    _ => return false,
                 }
             }
         }
@@ -702,25 +705,27 @@ async fn handle_translate_request(
             iova,
             size,
         } = request_tube.next().await.map_err(IommuError::Tube)?;
-        if let Some(mapper) = endpoints.borrow_mut().get(&endpoint_id) {
-            response_tubes
-                .get(&endpoint_id)
-                .unwrap()
-                .send(
-                    mapper
-                        .lock()
-                        .translate(iova, size)
-                        .map_err(|e| {
-                            error!("Failed to handle TranslateRequest: {}", e);
-                            e
-                        })
-                        .ok(),
-                )
-                .await
-                .map_err(IommuError::Tube)?;
-        } else {
-            error!("endpoint_id {} not found", endpoint_id)
-        }
+        let translate_response: Option<Vec<MemRegion>> =
+            if let Some(mapper) = endpoints.borrow_mut().get(&endpoint_id) {
+                mapper
+                    .lock()
+                    .translate(iova, size)
+                    .map_err(|e| {
+                        error!("Failed to handle TranslateRequest: {}", e);
+                        e
+                    })
+                    .ok()
+            } else {
+                error!("endpoint_id {} not found", endpoint_id);
+                continue;
+            };
+
+        response_tubes
+            .get(&endpoint_id)
+            .unwrap()
+            .send(translate_response)
+            .await
+            .map_err(IommuError::Tube)?;
     }
 }
 

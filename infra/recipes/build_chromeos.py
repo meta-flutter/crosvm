@@ -85,7 +85,8 @@ def BuildAndTest(api, board):
     )
     api.step(
         "Run unit tests",
-        [cros_sdk, "cros_run_unit_tests", "--board=%s" % board, "implicit-system"] + PACKAGE_LIST,
+        [cros_sdk, "cros_run_unit_tests", "--board=%s" % board, "--packages", "implicit-system"]
+        + PACKAGE_LIST,
     )
 
 
@@ -102,7 +103,7 @@ def RunSteps(api, properties):
         try:
             SetupSource(api, workspace)
             PrepareBuild(api)
-            BuildAndTest(api, properties.board or "amd64_generic")
+            BuildAndTest(api, properties.board or "amd64-generic")
         finally:
             CleanUp(api)
 

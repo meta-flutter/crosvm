@@ -120,25 +120,15 @@ pub fn process_transmit_queue<I: SignalableInterrupt>(
     while let Some(avail_desc) = transmit_queue.pop(mem) {
         let desc_index = avail_desc.index;
 
-        let reader = match Reader::new(mem.clone(), avail_desc) {
-            Ok(r) => r,
+        match Reader::new(mem.clone(), avail_desc) {
+            Ok(reader) => process_transmit_request(reader, output)
+                .unwrap_or_else(|e| error!("console: process_transmit_request failed: {}", e)),
             Err(e) => {
                 error!("console: failed to create reader: {}", e);
-                transmit_queue.add_used(mem, desc_index, 0);
-                needs_interrupt = true;
-                continue;
             }
         };
 
-        let len = match process_transmit_request(reader, output) {
-            Ok(written) => written,
-            Err(e) => {
-                error!("console: process_transmit_request failed: {}", e);
-                0
-            }
-        };
-
-        transmit_queue.add_used(mem, desc_index, len);
+        transmit_queue.add_used(mem, desc_index, 0);
         needs_interrupt = true;
     }
 
@@ -223,13 +213,13 @@ pub fn spawn_input_thread(
 ///
 /// * `reader` - The Reader with the data we want to write.
 /// * `output` - The output sink we are going to write the data to.
-pub fn process_transmit_request(mut reader: Reader, output: &mut dyn io::Write) -> io::Result<u32> {
+pub fn process_transmit_request(mut reader: Reader, output: &mut dyn io::Write) -> io::Result<()> {
     let len = reader.available_bytes();
     let mut data = vec![0u8; len];
     reader.read_exact(&mut data)?;
     output.write_all(&data)?;
     output.flush()?;
-    Ok(0)
+    Ok(())
 }
 
 impl Worker {

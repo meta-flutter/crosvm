@@ -39,10 +39,6 @@ use devices::virtio::block::block::DiskOption;
 use devices::virtio::gpu::{
     GpuDisplayParameters, GpuMode, GpuParameters, DEFAULT_DISPLAY_HEIGHT, DEFAULT_DISPLAY_WIDTH,
 };
-#[cfg(feature = "audio_cras")]
-use devices::virtio::snd::cras_backend::Error as CrasSndError;
-#[cfg(feature = "audio_cras")]
-use devices::virtio::vhost::user::device::run_cras_snd_device;
 use devices::virtio::vhost::user::device::{run_block_device, run_net_device};
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::VideoBackendType;
@@ -72,7 +68,8 @@ use vm_control::{
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_64::{set_enable_pnp_data_msr_config, set_itmt_msr_config};
 
-use rutabaga_gfx::calculate_context_mask;
+#[cfg(feature = "gpu")]
+use rutabaga_gfx::{calculate_context_mask, RutabagaWsi};
 
 const ONE_MB: u64 = 1 << 20;
 const MB_ALIGNED: u64 = ONE_MB - 1;
@@ -389,6 +386,17 @@ fn parse_gpu_options(s: Option<&str>, gpu_params: &mut GpuParameters) -> argumen
                         }
                     }
                 }
+                "wsi" => match v {
+                    "vk" => {
+                        gpu_params.wsi = Some(RutabagaWsi::Vulkan);
+                    }
+                    _ => {
+                        return Err(argument::Error::InvalidValue {
+                            value: v.to_string(),
+                            expected: String::from("gpu parameter 'wsi' should be vk"),
+                        });
+                    }
+                },
                 "width" => {
                     let width = v
                         .parse::<u32>()
@@ -2111,14 +2119,14 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
             ));
         }
 
-        let pcpu_count = sys::get_vcpu_count()?;
-        if cfg.vcpu_count.is_some() {
-            if pcpu_count != cfg.vcpu_count.unwrap() {
+        let pcpu_count =
+            base::number_of_logical_cores().expect("Could not read number of logical cores");
+        if let Some(vcpu_count) = cfg.vcpu_count {
+            if pcpu_count != vcpu_count {
                 return Err(argument::Error::ExpectedArgument(format!(
                     "`host-cpu-topology` requires the count of vCPUs({}) to equal the \
                             count of CPUs({}) on host.",
-                    cfg.vcpu_count.unwrap(),
-                    pcpu_count
+                    vcpu_count, pcpu_count
                 )));
             }
         } else {
@@ -2959,7 +2967,7 @@ with a '--backing_file'."
     Ok(())
 }
 
-fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
+fn start_device(args: std::env::Args) -> std::result::Result<(), ()> {
     let print_usage = || {
         print_help(
             "crosvm device",
@@ -2973,22 +2981,20 @@ fn start_device(mut args: std::env::Args) -> std::result::Result<(), ()> {
         return Err(());
     }
 
-    let device = args.next().unwrap();
-
-    let program_name = format!("crosvm device {}", device);
-
     let args = args.collect::<Vec<_>>();
     let args = args.iter().map(Deref::deref).collect::<Vec<_>>();
     let args = args.as_slice();
 
-    let result = match device.as_str() {
-        "block" => run_block_device(&program_name, args),
-        "net" => run_net_device(&program_name, args),
-        _ => sys::start_device(&program_name, device.as_str(), args),
+    let program_name = format!("crosvm device {}", args[0]);
+
+    let result = match args[0] {
+        "block" => run_block_device(&program_name, &args[1..]),
+        "net" => run_net_device(&program_name, &args[1..]),
+        _ => sys::start_device(&program_name, args),
     };
 
     result.map_err(|e| {
-        error!("Failed to run {} device: {:#}", device, e);
+        error!("Failed to run {} device: {:#}", args[0], e);
     })
 }
 
@@ -3850,6 +3856,32 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn parse_gpu_options_gfxstream_with_wsi_specified() {
+        let mut gpu_params: GpuParameters = Default::default();
+        assert!(parse_gpu_options(Some("backend=virglrenderer,wsi=vk"), &mut gpu_params).is_ok());
+        assert!(matches!(gpu_params.wsi, Some(RutabagaWsi::Vulkan)));
+
+        let mut gpu_params: GpuParameters = Default::default();
+        assert!(parse_gpu_options(Some("wsi=vk,backend=virglrenderer"), &mut gpu_params).is_ok());
+        assert!(matches!(gpu_params.wsi, Some(RutabagaWsi::Vulkan)));
+
+        let mut gpu_params: GpuParameters = Default::default();
+        assert!(parse_gpu_options(
+            Some("backend=virglrenderer,wsi=invalid_value"),
+            &mut gpu_params
+        )
+        .is_err());
+
+        let mut gpu_params: GpuParameters = Default::default();
+        assert!(parse_gpu_options(
+            Some("wsi=invalid_value,backend=virglrenderer"),
+            &mut gpu_params
+        )
+        .is_err());
     }
 
     #[test]

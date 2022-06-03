@@ -42,6 +42,8 @@ pub use tube::{Error as TubeError, RecvTube, Result as TubeResult, SendTube, Tub
 pub use wait_context::{EventToken, EventType, TriggeredEvent, WaitContext};
 pub use write_zeroes::{PunchHole, WriteZeroesAt};
 
+// TODO(b/233233301): reorganize platform specific exports under platform
+// namespaces instead of exposing them directly in base::.
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
         pub use sys::unix;
@@ -127,7 +129,7 @@ pub use crate::descriptor::{
 
 pub use platform::getpid;
 pub use platform::{get_filesystem_type, open_file};
-pub use platform::{pagesize, round_up_to_page_size};
+pub use platform::{number_of_logical_cores, pagesize, round_up_to_page_size};
 pub use platform::{FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen, FileSync};
 pub use platform::{MappedRegion, MemoryMappingArena, MmapError};
 

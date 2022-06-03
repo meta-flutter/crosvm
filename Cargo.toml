@@ -7,9 +7,6 @@ default-run = "crosvm"
 # b:223855233
 resolver = "1"
 
-[lib]
-path = "src/crosvm.rs"
-
 [[bin]]
 name = "crosvm"
 path = "src/main.rs"
@@ -47,6 +44,7 @@ members = [
     "aarch64",
     "acpi_tables",
     "arch",
+    "argh_helpers",
     "base",
     "bit_field",
     "cros_async",
@@ -151,6 +149,7 @@ x = ["devices/x"]
 anyhow = "1.0.32"
 arch = { path = "arch" }
 argh = "0.1"
+argh_helpers = { path = "argh_helpers" }
 assertions = { path = "common/assertions" }
 audio_streams = "*"
 base = "*"

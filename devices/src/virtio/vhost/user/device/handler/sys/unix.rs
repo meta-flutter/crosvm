@@ -4,21 +4,19 @@
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use anyhow::{Context, Result};
-use base::{
-    clear_fd_flags, error, info, AsRawDescriptor, Event, SafeDescriptor, UnlinkUnixListener,
-};
+use base::{clear_fd_flags, error, info, AsRawDescriptor, Event, SafeDescriptor};
 use cros_async::{AsyncWrapper, Executor};
 use vm_memory::GuestMemory;
 use vmm_vhost::{
     connection::{
+        socket::Listener as SocketListener,
         vfio::{Endpoint as VfioEndpoint, Listener as VfioListener},
-        Endpoint,
+        Endpoint, Listener,
     },
     message::{MasterReq, VhostUserMemoryRegion},
     Error as VhostError, Protocol, Result as VhostResult, SlaveListener, SlaveReqHandler,
@@ -260,9 +258,8 @@ where
     /// Creates a listening socket at `socket` and handles incoming messages from the VMM, which are
     /// dispatched to the device backend via the `VhostUserBackend` trait methods.
     pub async fn run<P: AsRef<Path>>(self, socket: P, ex: &Executor) -> Result<()> {
-        let listener = UnixListener::bind(socket)
-            .map(UnlinkUnixListener)
-            .context("failed to create a UNIX domain socket listener")?;
+        let listener = SocketListener::new(socket, true /* unlink */)
+            .context("failed to create a socket listener")?;
         return self.run_with_listener(listener, ex).await;
     }
 
@@ -270,18 +267,18 @@ where
     /// VMM, which are dispatched to the device backend via the `VhostUserBackend` trait methods.
     pub async fn run_with_listener(
         self,
-        listener: UnlinkUnixListener,
+        mut listener: SocketListener,
         ex: &Executor,
     ) -> Result<()> {
-        let (socket, _) = ex
+        let socket = ex
             .spawn_blocking(move || {
                 listener
                     .accept()
                     .context("failed to accept an incoming connection")
             })
-            .await?;
-        let req_handler =
-            SlaveReqHandler::from_stream(socket, Arc::new(std::sync::Mutex::new(self)));
+            .await?
+            .ok_or(anyhow!("failed to accept an incoming connection"))?;
+        let req_handler = SlaveReqHandler::from_stream(socket, std::sync::Mutex::new(self));
 
         run_handler(req_handler, ex).await
     }
@@ -299,11 +296,8 @@ where
         let mut listener = VfioListener::new(driver)
             .map_err(|e| anyhow!("failed to create a VFIO listener: {}", e))
             .and_then(|l| {
-                SlaveListener::<VfioEndpoint<_, _>, _>::new(
-                    l,
-                    Arc::new(std::sync::Mutex::new(self)),
-                )
-                .map_err(|e| anyhow!("failed to create SlaveListener: {}", e))
+                SlaveListener::<VfioEndpoint<_, _>, _>::new(l, std::sync::Mutex::new(self))
+                    .map_err(|e| anyhow!("failed to create SlaveListener: {}", e))
             })?;
 
         let req_handler = listener
@@ -376,9 +370,7 @@ mod tests {
         });
 
         // Device side
-        let handler = Arc::new(std::sync::Mutex::new(DeviceRequestHandler::new(
-            FakeBackend::new(),
-        )));
+        let handler = std::sync::Mutex::new(DeviceRequestHandler::new(FakeBackend::new()));
         let mut listener = SlaveListener::<SocketEndpoint<_>, _>::new(listener, handler).unwrap();
 
         // Notify listener is ready.

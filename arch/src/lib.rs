@@ -225,6 +225,10 @@ pub trait LinuxArch {
     /// * `vcpu_id` - The id of the given `vcpu`.
     /// * `num_cpus` - Number of virtual CPUs the guest will have.
     /// * `has_bios` - Whether the `VmImage` is a `Bios` image
+    /// * `no_smt` - Wheter diabling SMT.
+    /// * `host_cpu_topology` - whether enabling host cpu topology.
+    /// * `enable_pnp_data` - whether enabling PnP statistics data.
+    /// * `itmt` - whether enabling ITMT scheduler
     fn configure_vcpu<V: Vm>(
         vm: &V,
         hypervisor: &dyn HypervisorArch,
@@ -235,6 +239,7 @@ pub trait LinuxArch {
         has_bios: bool,
         no_smt: bool,
         host_cpu_topology: bool,
+        enable_pnp_data: bool,
         itmt: bool,
     ) -> Result<(), Self::Error>;
 
@@ -922,6 +927,8 @@ pub struct MsrConfig {
     pub action: MsrAction,
     /// MSR source CPU.
     pub from: MsrValueFrom,
+    /// Whether to override KVM MSR emulation.
+    pub filter: bool,
 }
 
 #[sorted]

@@ -70,7 +70,7 @@ use vm_control::{
     VmResponse,
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use x86_64::set_itmt_msr_config;
+use x86_64::{set_enable_pnp_data_msr_config, set_itmt_msr_config};
 
 use rutabaga_gfx::calculate_context_mask;
 
@@ -543,6 +543,7 @@ fn parse_userspace_msr_options(value: &str) -> argument::Result<(u32, MsrConfig)
     let mut rw_type: Option<MsrRWType> = None;
     let mut action: Option<MsrAction> = None;
     let mut from = MsrValueFrom::RWFromRunningCPU;
+    let mut filter: bool = false;
 
     let mut options = argument::parse_key_value_options("userspace-msr", value, ',');
     let index: u32 = options
@@ -571,6 +572,12 @@ fn parse_userspace_msr_options(value: &str) -> argument::Result<(u32, MsrConfig)
                 "cpu0" => from = MsrValueFrom::RWFromCPU0,
                 _ => return Err(opt.invalid_value_err(String::from("bad from"))),
             },
+            "filter" => match opt.value()? {
+                "yes" => filter = true,
+                "no" => filter = false,
+                _ => return Err(opt.invalid_value_err(String::from("bad filter"))),
+            },
+
             _ => return Err(opt.invalid_key_err()),
         }
     }
@@ -589,6 +596,7 @@ fn parse_userspace_msr_options(value: &str) -> argument::Result<(u32, MsrConfig)
             rw_type,
             action,
             from,
+            filter,
         },
     ))
 }
@@ -1783,6 +1791,9 @@ fn set_argument(cfg: &mut Config, name: &str, value: Option<&str>) -> argument::
         "host-cpu-topology" => {
             cfg.host_cpu_topology = sys::use_host_cpu_topology();
         }
+        "enable-pnp-data" => {
+            cfg.enable_pnp_data = true;
+        }
         "privileged-vm" => {
             cfg.privileged_vm = true;
         }
@@ -2134,13 +2145,26 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
         if !cfg.userspace_msr.is_empty() {
             for (_, msr_config) in cfg.userspace_msr.iter() {
                 if msr_config.from == MsrValueFrom::RWFromRunningCPU {
-                    return Err(argument::Error::UnknownArgument(
+                    return Err(argument::Error::ExpectedArgument(
                         "`userspace-msr` must set `cpu0` if `host-cpu-topology` is not set"
                             .to_owned(),
                     ));
                 }
             }
         }
+    }
+    if cfg.enable_pnp_data {
+        if !cfg.host_cpu_topology {
+            return Err(argument::Error::ExpectedArgument(
+                "setting `enable_pnp_data` must require `host-cpu-topology` is set previously."
+                    .to_owned(),
+            ));
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        set_enable_pnp_data_msr_config(cfg.itmt, &mut cfg.userspace_msr).map_err(|e| {
+            argument::Error::UnknownArgument(format!("MSR can't be passed through {}", e))
+        })?;
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if cfg.itmt {
@@ -2181,7 +2205,7 @@ fn validate_arguments(cfg: &mut Config) -> std::result::Result<(), argument::Err
             }
         }
         set_itmt_msr_config(&mut cfg.userspace_msr).map_err(|e| {
-            argument::Error::UnknownArgument(format!("the cpu doesn't support itmt {}", e))
+            argument::Error::UnexpectedValue(format!("the cpu doesn't support itmt {}", e))
         })?;
     }
     if !cfg.balloon && cfg.balloon_control.is_some() {
@@ -2419,16 +2443,20 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("direct-gpe", "gpe", "Enable GPE interrupt and register access passthrough"),
           Argument::value("dmi", "DIR", "Directory with smbios_entry_point/DMI files"),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-          Argument::value("userspace-msr", "INDEX,type=TYPE,action=TYPE,[from=TYPE]",
+          Argument::value("userspace-msr", "INDEX,type=TYPE,action=ACTION,[from=FROM],[filter=FILTER]",
                               "Userspace MSR handling. Takes INDEX of the MSR and how they are handled.
 
                               type=(r|w|rw|wr) - read/write permission control.
 
                               action=(pass|emu) - if the control of msr is effective on host.
 
-                              from=(cpu0) - source of msr value. if not set, the source is running CPU."),
+                              from=(cpu0) - source of msr value. if not set, the source is running CPU.
+
+                              filter=(yes|no) - if the msr is filtered in KVM."),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("host-cpu-topology", "Use mirror cpu topology of Host for Guest VM, also copy some cpu feature to Guest VM."),
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+          Argument::flag("enable-pnp-data", "Expose Power and Perfomance (PnP) data to guest and guest can show these PnP data."),
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
           Argument::flag("itmt", "Allow to enable ITMT scheduling feature in VM. The success of enabling depends on HWP and ACPI CPPC support on hardware."),
           Argument::flag("privileged-vm", "Grant this Guest VM certian privileges to manage Host resources, such as power management."),
@@ -3962,6 +3990,13 @@ mod tests {
 
     #[test]
     fn parse_userspace_msr_options_test() {
+        let (pass_cpu0_index, pass_cpu0_cfg) =
+            parse_userspace_msr_options("0x10,type=w,action=pass,filter=yes").unwrap();
+        assert_eq!(pass_cpu0_index, 0x10);
+        assert_eq!(pass_cpu0_cfg.rw_type, MsrRWType::WriteOnly);
+        assert_eq!(pass_cpu0_cfg.action, MsrAction::MsrPassthrough);
+        assert!(pass_cpu0_cfg.filter);
+
         let (pass_cpu0_index, pass_cpu0_cfg) =
             parse_userspace_msr_options("0x10,type=r,action=pass,from=cpu0").unwrap();
         assert_eq!(pass_cpu0_index, 0x10);

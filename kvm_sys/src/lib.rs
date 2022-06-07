@@ -9,7 +9,8 @@
 #![allow(non_snake_case)]
 
 use base::{ioctl_io_nr, ioctl_ior_nr, ioctl_iow_nr, ioctl_iowr_nr};
-use data_model::{flexible_array_impl, FlexibleArray};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use data_model::flexible_array_impl;
 // Each of the below modules defines ioctls specific to their platform.
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

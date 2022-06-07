@@ -14,11 +14,10 @@ use smallvec::SmallVec;
 
 use super::{errno_result, Result};
 use crate::{
-    AsRawDescriptor, EventToken, EventType, FromRawDescriptor, IntoRawDescriptor, RawDescriptor,
-    TriggeredEvent,
+    AsRawDescriptor, EventToken, EventType, FromRawDescriptor, RawDescriptor, TriggeredEvent,
 };
 
-const POLL_CONTEXT_MAX_EVENTS: usize = 16;
+const EVENT_CONTEXT_MAX_EVENTS: usize = 16;
 
 impl From<EventType> for u32 {
     fn from(et: EventType) -> u32 {
@@ -32,70 +31,36 @@ impl From<EventType> for u32 {
     }
 }
 
-/// Watching events taken by PollContext.
-pub struct WatchingEvents(u32);
-
-impl WatchingEvents {
-    /// Returns empty Events.
-    #[inline(always)]
-    pub fn empty() -> WatchingEvents {
-        WatchingEvents(0)
-    }
-
-    /// Build Events from raw epoll events (defined in epoll_ctl(2)).
-    #[inline(always)]
-    pub fn new(raw: u32) -> WatchingEvents {
-        WatchingEvents(raw)
-    }
-
-    /// Set read events.
-    #[inline(always)]
-    pub fn set_read(self) -> WatchingEvents {
-        WatchingEvents(self.0 | EPOLLIN as u32)
-    }
-
-    /// Set write events.
-    #[inline(always)]
-    pub fn set_write(self) -> WatchingEvents {
-        WatchingEvents(self.0 | EPOLLOUT as u32)
-    }
-
-    /// Get the underlying epoll events.
-    pub fn get_raw(&self) -> u32 {
-        self.0
-    }
-}
-
 /// Used to poll multiple objects that have file descriptors.
 ///
 /// See [`crate::WaitContext`] for an example that uses the cross-platform wrapper.
-pub struct PollContext<T> {
+pub struct EventContext<T> {
     epoll_ctx: File,
     // Needed to satisfy usage of T
     tokens: PhantomData<[T]>,
 }
 
-impl<T: EventToken> PollContext<T> {
-    /// Creates a new `PollContext`.
-    pub fn new() -> Result<PollContext<T>> {
+impl<T: EventToken> EventContext<T> {
+    /// Creates a new `EventContext`.
+    pub fn new() -> Result<EventContext<T>> {
         // Safe because we check the return value.
         let epoll_fd = unsafe { epoll_create1(EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
             return errno_result();
         }
-        Ok(PollContext {
+        Ok(EventContext {
             epoll_ctx: unsafe { File::from_raw_descriptor(epoll_fd) },
             tokens: PhantomData,
         })
     }
 
-    /// Creates a new `PollContext` and adds the slice of `fd` and `token` tuples to the new
+    /// Creates a new `EventContext` and adds the slice of `fd` and `token` tuples to the new
     /// context.
     ///
     /// This is equivalent to calling `new` followed by `add_many`. If there is an error, this will
     /// return the error instead of the new context.
-    pub fn build_with(fd_tokens: &[(&dyn AsRawDescriptor, T)]) -> Result<PollContext<T>> {
-        let ctx = PollContext::new()?;
+    pub fn build_with(fd_tokens: &[(&dyn AsRawDescriptor, T)]) -> Result<EventContext<T>> {
+        let ctx = EventContext::new()?;
         ctx.add_many(fd_tokens)?;
         Ok(ctx)
     }
@@ -222,7 +187,7 @@ impl<T: EventToken> PollContext<T> {
         // We submit an uninitialized array to the `epoll_wait` system call, which returns how many
         // elements it initialized, and then we convert only the initialized `MaybeUnint` values
         // into `epoll_event` structures after the call.
-        let mut epoll_events: [MaybeUninit<epoll_event>; POLL_CONTEXT_MAX_EVENTS] =
+        let mut epoll_events: [MaybeUninit<epoll_event>; EVENT_CONTEXT_MAX_EVENTS] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
         let timeout_millis = if timeout.as_secs() as i64 == i64::max_value() {
@@ -278,15 +243,9 @@ impl<T: EventToken> PollContext<T> {
     }
 }
 
-impl<T: EventToken> AsRawDescriptor for PollContext<T> {
+impl<T: EventToken> AsRawDescriptor for EventContext<T> {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.epoll_ctx.as_raw_descriptor()
-    }
-}
-
-impl<T: EventToken> IntoRawDescriptor for PollContext<T> {
-    fn into_raw_descriptor(self) -> RawDescriptor {
-        self.epoll_ctx.into_raw_descriptor()
     }
 }
 
@@ -297,12 +256,12 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn poll_context() {
+    fn event_context() {
         let evt1 = Event::new().unwrap();
         let evt2 = Event::new().unwrap();
         evt1.write(1).unwrap();
         evt2.write(1).unwrap();
-        let ctx: PollContext<u32> = PollContext::build_with(&[(&evt1, 1), (&evt2, 2)]).unwrap();
+        let ctx: EventContext<u32> = EventContext::build_with(&[(&evt1, 1), (&evt2, 2)]).unwrap();
 
         let mut evt_count = 0;
         while evt_count < 2 {
@@ -325,9 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn poll_context_overflow() {
-        const EVT_COUNT: usize = POLL_CONTEXT_MAX_EVENTS * 2 + 1;
-        let ctx: PollContext<usize> = PollContext::new().unwrap();
+    fn event_context_overflow() {
+        const EVT_COUNT: usize = EVENT_CONTEXT_MAX_EVENTS * 2 + 1;
+        let ctx: EventContext<usize> = EventContext::new().unwrap();
         let mut evts = Vec::with_capacity(EVT_COUNT);
         for i in 0..EVT_COUNT {
             let evt = Event::new().unwrap();
@@ -345,8 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn poll_context_timeout() {
-        let ctx: PollContext<u32> = PollContext::new().unwrap();
+    fn event_context_timeout() {
+        let ctx: EventContext<u32> = EventContext::new().unwrap();
         let dur = Duration::from_millis(10);
         let start_inst = Instant::now();
         ctx.wait_timeout(dur).unwrap();

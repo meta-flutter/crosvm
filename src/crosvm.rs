@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use argh::FromArgs;
+use base::debug;
 use devices::virtio::vhost::user::device;
 
 use super::sys;
@@ -95,31 +96,73 @@ pub enum Command {
     Vfio(VfioCrosvmCommand),
 }
 
-#[generate_catchall_args]
+#[derive(FromArgs)]
 #[argh(subcommand, name = "balloon")]
-/// Set balloon size of the crosvm instance
-pub struct BalloonCommand {}
+/// Set balloon size of the crosvm instance to `SIZE` bytes
+pub struct BalloonCommand {
+    #[argh(positional, arg_name = "SIZE")]
+    /// amount of bytes
+    pub num_bytes: u64,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
 
-#[generate_catchall_args]
+#[derive(argh::FromArgs)]
 #[argh(subcommand, name = "balloon_stats")]
-/// Prints virtio balloon statistics
-pub struct BalloonStatsCommand {}
+/// Prints virtio balloon statistics for a `VM_SOCKET`
+pub struct BalloonStatsCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
 
-#[generate_catchall_args]
+#[derive(FromArgs)]
 #[argh(subcommand, name = "battery")]
 /// Modify battery
-pub struct BatteryCommand {}
+pub struct BatteryCommand {
+    #[argh(positional, arg_name = "BATTERY_TYPE")]
+    /// battery type
+    pub battery_type: String,
+    #[argh(positional)]
+    /// battery property
+    /// status | present | health | capacity | aconline
+    pub property: String,
+    #[argh(positional)]
+    /// battery property target
+    /// STATUS | PRESENT | HEALTH | CAPACITY | ACONLINE
+    pub target: String,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
 
 #[cfg(feature = "composite-disk")]
-#[generate_catchall_args]
+#[derive(FromArgs)]
 #[argh(subcommand, name = "create_composite")]
 /// Create a new composite disk image file
-pub struct CreateCompositeCommand {}
+pub struct CreateCompositeCommand {
+    #[argh(positional, arg_name = "PATH")]
+    /// image path
+    pub path: String,
+    #[argh(positional, arg_name = "LABEL:PARTITION")]
+    /// partitions
+    pub partitions: Vec<String>,
+}
 
-#[generate_catchall_args]
+#[derive(FromArgs)]
 #[argh(subcommand, name = "create_qcow2")]
-/// Create a new qcow2 disk image file
-pub struct CreateQcow2Command {}
+/// Create Qcow2 image given path and size
+/// Either SIZE or --backing-file need to be specified
+pub struct CreateQcow2Command {
+    #[argh(positional, arg_name = "PATH")]
+    pub file_path: String,
+    #[argh(positional, arg_name = "SIZE")]
+    pub size: Option<u64>,
+    #[argh(option)]
+    /// path to backing file
+    pub backing_file: Option<String>,
+}
 
 #[generate_catchall_args]
 #[argh(subcommand, name = "disk")]
@@ -197,10 +240,13 @@ pub struct GpeCommand {
     pub socket_path: String,
 }
 
-#[generate_catchall_args]
+#[derive(FromArgs)]
 #[argh(subcommand, name = "usb")]
 /// Manage attached virtual USB devices.
-pub struct UsbCommand {}
+pub struct UsbCommand {
+    #[argh(subcommand)]
+    pub command: UsbSubCommand,
+}
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "version")]
@@ -232,6 +278,53 @@ pub enum CrossPlatformDevicesCommands {
 pub enum DevicesSubcommand {
     CrossPlatform(CrossPlatformDevicesCommands),
     Sys(sys::DevicesSubcommand),
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+pub enum UsbSubCommand {
+    Attach(UsbAttachCommand),
+    Detach(UsbDetachCommand),
+    List(UsbListCommand),
+}
+
+#[derive(FromArgs)]
+/// Attach usb device
+#[argh(subcommand, name = "attach")]
+pub struct UsbAttachCommand {
+    #[argh(
+        positional,
+        arg_name = "BUS_ID:ADDR:BUS_NUM:DEV_NUM",
+        from_str_fn(parse_bus_id_addr)
+    )]
+    pub addr: (u8, u8, u16, u16),
+    #[argh(positional)]
+    /// usb device path
+    pub dev_path: String,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
+/// Detach usb device
+#[argh(subcommand, name = "detach")]
+pub struct UsbDetachCommand {
+    #[argh(positional, arg_name = "PORT")]
+    /// usb port
+    pub port: u8,
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
+/// Detach usb device
+#[argh(subcommand, name = "list")]
+pub struct UsbListCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
 }
 
 /// Indicates the location and kind of executable kernel for a VM.
@@ -536,6 +629,22 @@ impl Default for JailConfig {
             seccomp_policy_dir: PathBuf::from(SECCOMP_POLICY_DIR),
             seccomp_log_failures: false,
         }
+    }
+}
+
+fn parse_bus_id_addr(v: &str) -> Result<(u8, u8, u16, u16), String> {
+    debug!("parse_bus_id_addr: {}", v);
+    let mut ids = v.split(':');
+    let errorre = move |item| move |e| format!("{}: {}", item, e);
+    match (ids.next(), ids.next(), ids.next(), ids.next()) {
+        (Some(bus_id), Some(addr), Some(vid), Some(pid)) => {
+            let bus_id = bus_id.parse::<u8>().map_err(errorre("bus_id"))?;
+            let addr = addr.parse::<u8>().map_err(errorre("addr"))?;
+            let vid = u16::from_str_radix(vid, 16).map_err(errorre("vid"))?;
+            let pid = u16::from_str_radix(pid, 16).map_err(errorre("pid"))?;
+            Ok((bus_id, addr, vid, pid))
+        }
+        _ => Err(String::from("BUS_ID:ADDR:BUS_NUM:DEV_NUM")),
     }
 }
 

@@ -25,7 +25,7 @@ use arch::{
     Pstore, VcpuAffinity,
 };
 use base::syslog::LogConfig;
-use base::{debug, error, getpid, info, pagesize, syslog};
+use base::{error, getpid, info, pagesize, syslog};
 mod crosvm;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", feature = "direct"))]
 use crosvm::argument::parse_hex_or_decimal;
@@ -64,7 +64,7 @@ use uuid::Uuid;
 use vm_control::{
     client::{
         do_modify_battery, do_usb_attach, do_usb_detach, do_usb_list, handle_request, vms_request,
-        ModifyUsbError, ModifyUsbResult,
+        ModifyUsbResult,
     },
     BalloonControlCommand, BatteryType, DiskControlCommand, UsbControlResult, VmRequest,
     VmResponse,
@@ -542,6 +542,8 @@ fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
     const VALID_VIDEO_BACKENDS: &[&str] = &[
         #[cfg(feature = "libvda")]
         "libvda",
+        #[cfg(feature = "ffmpeg")]
+        "ffmpeg",
     ];
 
     match s {
@@ -549,6 +551,8 @@ fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "libvda")] {
                     Ok(VideoBackendType::Libvda)
+                } else if #[cfg(feature = "ffmpeg")] {
+                    Ok(VideoBackendType::Ffmpeg)
                 }
             }
         }
@@ -556,6 +560,8 @@ fn parse_video_options(s: Option<&str>) -> argument::Result<VideoBackendType> {
         Some("libvda") => Ok(VideoBackendType::Libvda),
         #[cfg(feature = "libvda")]
         Some("libvda-vd") => Ok(VideoBackendType::LibvdaVd),
+        #[cfg(feature = "ffmpeg")]
+        Some("ffmpeg") => Ok(VideoBackendType::Ffmpeg),
         Some(s) => Err(argument::Error::InvalidValue {
             value: s.to_owned(),
             expected: format!("should be one of ({})", VALID_VIDEO_BACKENDS.join("|")),
@@ -2520,7 +2526,7 @@ iommu=on|off - indicates whether to enable virtio IOMMU for this device"),
           Argument::value("vfio-platform", "PATH", "Path to sysfs of platform pass through"),
           #[cfg(feature = "video-decoder")]
           Argument::flag_or_value("video-decoder", "[backend]", "(EXPERIMENTAL) enable virtio-video decoder device
-                              Possible backend values: libvda"),
+                              Possible backend values: libvda|ffmpeg"),
           #[cfg(feature = "video-encoder")]
           Argument::flag_or_value("video-encoder", "[backend]", "(EXPERIMENTAL) enable virtio-video encoder device
                               Possible backend values: libvda"),
@@ -2741,37 +2747,17 @@ fn inject_gpe(cmd: crosvm::GpeCommand) -> std::result::Result<(), ()> {
 }
 
 fn balloon_vms(cmd: crosvm::BalloonCommand) -> std::result::Result<(), ()> {
-    if cmd.args.len() < 2 {
-        print_help("crosvm balloon", "SIZE VM_SOCKET...", &[]);
-        println!("Set the ballon size of the crosvm instance to `SIZE` bytes.");
-        return Err(());
-    }
-    let mut args = cmd.args.into_iter();
-    let num_bytes = match args.next().unwrap().parse::<u64>() {
-        Ok(n) => n,
-        Err(_) => {
-            error!("Failed to parse number of bytes");
-            return Err(());
-        }
+    let command = BalloonControlCommand::Adjust {
+        num_bytes: cmd.num_bytes,
     };
-
-    let command = BalloonControlCommand::Adjust { num_bytes };
-    let socket_path = &args.next().unwrap();
-    let socket_path = Path::new(&socket_path);
+    let socket_path = Path::new(&cmd.socket_path);
     vms_request(&VmRequest::BalloonCommand(command), socket_path)
 }
 
 fn balloon_stats(cmd: crosvm::BalloonStatsCommand) -> std::result::Result<(), ()> {
-    if cmd.args.len() != 1 {
-        print_help("crosvm balloon_stats", "VM_SOCKET", &[]);
-        println!("Prints virtio balloon statistics for a `VM_SOCKET`.");
-        return Err(());
-    }
-    let mut args = cmd.args.into_iter();
     let command = BalloonControlCommand::Stats {};
     let request = &VmRequest::BalloonCommand(command);
-    let socket_path = &args.next().unwrap();
-    let socket_path = Path::new(&socket_path);
+    let socket_path = Path::new(&cmd.socket_path);
     let response = handle_request(request, socket_path)?;
     match serde_json::to_string_pretty(&response) {
         Ok(response_json) => println!("{}", response_json),
@@ -2787,30 +2773,9 @@ fn balloon_stats(cmd: crosvm::BalloonStatsCommand) -> std::result::Result<(), ()
 }
 
 fn modify_battery(cmd: crosvm::BatteryCommand) -> std::result::Result<(), ()> {
-    if cmd.args.len() < 4 {
-        print_help(
-            "crosvm battery BATTERY_TYPE ",
-            "[status STATUS | \
-             present PRESENT | \
-             health HEALTH | \
-             capacity CAPACITY | \
-             aconline ACONLINE ] \
-             VM_SOCKET...",
-            &[],
-        );
-        return Err(());
-    }
-    let mut args = cmd.args.into_iter();
+    let socket_path = Path::new(&cmd.socket_path);
 
-    // This unwrap will not panic because of the above length check.
-    let battery_type = args.next().unwrap();
-    let property = args.next().unwrap();
-    let target = args.next().unwrap();
-
-    let socket_path = args.next().unwrap();
-    let socket_path = Path::new(&socket_path);
-
-    do_modify_battery(socket_path, &*battery_type, &*property, &*target)
+    do_modify_battery(socket_path, &cmd.battery_type, &cmd.property, &cmd.target)
 }
 
 fn modify_vfio(cmd: crosvm::VfioCrosvmCommand) -> std::result::Result<(), ()> {
@@ -2857,14 +2822,7 @@ fn modify_vfio(cmd: crosvm::VfioCrosvmCommand) -> std::result::Result<(), ()> {
 
 #[cfg(feature = "composite-disk")]
 fn create_composite(cmd: crosvm::CreateCompositeCommand) -> std::result::Result<(), ()> {
-    if cmd.args.len() < 1 {
-        print_help("crosvm create_composite", "PATH [LABEL:PARTITION]..", &[]);
-        println!("Creates a new composite disk image containing the given partition images");
-        return Err(());
-    }
-
-    let mut args = cmd.args.into_iter();
-    let composite_image_path = args.next().unwrap();
+    let composite_image_path = &cmd.path;
     let zero_filler_path = format!("{}.filler", composite_image_path);
     let header_path = format!("{}.header", composite_image_path);
     let footer_path = format!("{}.footer", composite_image_path);
@@ -2912,7 +2870,8 @@ fn create_composite(cmd: crosvm::CreateCompositeCommand) -> std::result::Result<
             );
         })?;
 
-    let partitions = args
+    let partitions = cmd
+        .partitions
         .into_iter()
         .map(|partition_arg| {
             if let [label, path] = partition_arg.split(":").collect::<Vec<_>>()[..] {
@@ -2967,57 +2926,10 @@ fn create_composite(cmd: crosvm::CreateCompositeCommand) -> std::result::Result<
 }
 
 fn create_qcow2(cmd: crosvm::CreateQcow2Command) -> std::result::Result<(), ()> {
-    let arguments = [
-        Argument::positional("PATH", "where to create the qcow2 image"),
-        Argument::positional("[SIZE]", "the expanded size of the image"),
-        Argument::value(
-            "backing_file",
-            "path/to/file",
-            " the file to back the image",
-        ),
-    ];
-    let args = cmd.args.into_iter();
-    let mut positional_index = 0;
-    let mut file_path = String::from("");
-    let mut size: Option<u64> = None;
-    let mut backing_file: Option<String> = None;
-    set_arguments(args, &arguments[..], |name, value| {
-        match (name, positional_index) {
-            ("", 0) => {
-                // NAME
-                positional_index += 1;
-                file_path = value.unwrap().to_owned();
-            }
-            ("", 1) => {
-                // [SIZE]
-                positional_index += 1;
-                size = Some(value.unwrap().parse::<u64>().map_err(|_| {
-                    argument::Error::InvalidValue {
-                        value: value.unwrap().to_owned(),
-                        expected: String::from("SIZE should be a nonnegative integer"),
-                    }
-                })?);
-            }
-            ("", _) => {
-                return Err(argument::Error::TooManyArguments(
-                    "Expected at most 2 positional arguments".to_owned(),
-                ));
-            }
-            ("backing_file", _) => {
-                backing_file = value.map(|x| x.to_owned());
-            }
-            _ => unreachable!(),
-        };
-        Ok(())
-    })
-    .map_err(|e| {
-        error!("Unable to parse command line arguments: {}", e);
-    })?;
-    if file_path.is_empty() || !(size.is_some() ^ backing_file.is_some()) {
-        print_help("crosvm create_qcow2", "PATH [SIZE]", &arguments);
+    if !(cmd.size.is_some() ^ cmd.backing_file.is_some()) {
         println!(
             "Create a new QCOW2 image at `PATH` of either the specified `SIZE` in bytes or
-with a '--backing_file'."
+    with a '--backing_file'."
         );
         return Err(());
     }
@@ -3027,19 +2939,19 @@ with a '--backing_file'."
         .read(true)
         .write(true)
         .truncate(true)
-        .open(&file_path)
+        .open(&cmd.file_path)
         .map_err(|e| {
-            error!("Failed opening qcow file at '{}': {}", file_path, e);
+            error!("Failed opening qcow file at '{}': {}", cmd.file_path, e);
         })?;
 
-    match (size, backing_file) {
+    match (cmd.size, cmd.backing_file) {
         (Some(size), None) => QcowFile::new(file, size).map_err(|e| {
-            error!("Failed to create qcow file at '{}': {}", file_path, e);
+            error!("Failed to create qcow file at '{}': {}", cmd.file_path, e);
         })?,
         (None, Some(backing_file)) => {
             QcowFile::new_from_backing(file, &backing_file, disk::MAX_NESTING_DEPTH).map_err(
                 |e| {
-                    error!("Failed to create qcow file at '{}': {}", file_path, e);
+                    error!("Failed to create qcow file at '{}': {}", cmd.file_path, e);
                 },
             )?
         }
@@ -3112,88 +3024,29 @@ fn make_rt(cmd: crosvm::MakeRTCommand) -> std::result::Result<(), ()> {
     vms_request(&VmRequest::MakeRT, socket_path)
 }
 
-fn parse_bus_id_addr(v: &str) -> ModifyUsbResult<(u8, u8, u16, u16)> {
-    debug!("parse_bus_id_addr: {}", v);
-    let mut ids = v.split(':');
-    match (ids.next(), ids.next(), ids.next(), ids.next()) {
-        (Some(bus_id), Some(addr), Some(vid), Some(pid)) => {
-            let bus_id = bus_id
-                .parse::<u8>()
-                .map_err(|e| ModifyUsbError::ArgParseInt("bus_id", bus_id.to_owned(), e))?;
-            let addr = addr
-                .parse::<u8>()
-                .map_err(|e| ModifyUsbError::ArgParseInt("addr", addr.to_owned(), e))?;
-            let vid = u16::from_str_radix(vid, 16)
-                .map_err(|e| ModifyUsbError::ArgParseInt("vid", vid.to_owned(), e))?;
-            let pid = u16::from_str_radix(pid, 16)
-                .map_err(|e| ModifyUsbError::ArgParseInt("pid", pid.to_owned(), e))?;
-            Ok((bus_id, addr, vid, pid))
-        }
-        _ => Err(ModifyUsbError::ArgParse(
-            "BUS_ID_ADDR_BUS_NUM_DEV_NUM",
-            v.to_owned(),
-        )),
-    }
+fn usb_attach(cmd: crosvm::UsbAttachCommand) -> ModifyUsbResult<UsbControlResult> {
+    let (bus, addr, vid, pid) = cmd.addr;
+    let socket_path = Path::new(&cmd.socket_path);
+    let dev_path = Path::new(&cmd.dev_path);
+
+    do_usb_attach(socket_path, bus, addr, vid, pid, dev_path)
 }
 
-fn usb_attach(args: Vec<String>) -> ModifyUsbResult<UsbControlResult> {
-    let mut args = args.into_iter();
-    let val = args
-        .next()
-        .ok_or(ModifyUsbError::ArgMissing("BUS_ID_ADDR_BUS_NUM_DEV_NUM"))?;
-    let (bus, addr, vid, pid) = parse_bus_id_addr(&val)?;
-    let dev_path = PathBuf::from(
-        args.next()
-            .ok_or(ModifyUsbError::ArgMissing("usb device path"))?,
-    );
-
-    let socket_path = args
-        .next()
-        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
-    let socket_path = Path::new(&socket_path);
-
-    do_usb_attach(socket_path, bus, addr, vid, pid, &dev_path)
+fn usb_detach(cmd: crosvm::UsbDetachCommand) -> ModifyUsbResult<UsbControlResult> {
+    let socket_path = Path::new(&cmd.socket_path);
+    do_usb_detach(socket_path, cmd.port)
 }
 
-fn usb_detach(args: Vec<String>) -> ModifyUsbResult<UsbControlResult> {
-    let mut args = args.into_iter();
-    let port: u8 = args
-        .next()
-        .map_or(Err(ModifyUsbError::ArgMissing("PORT")), |p| {
-            p.parse::<u8>()
-                .map_err(|e| ModifyUsbError::ArgParseInt("PORT", p.to_owned(), e))
-        })?;
-    let socket_path = args
-        .next()
-        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
-    let socket_path = Path::new(&socket_path);
-    do_usb_detach(socket_path, port)
-}
-
-fn usb_list(args: Vec<String>) -> ModifyUsbResult<UsbControlResult> {
-    let mut args = args.into_iter();
-    let socket_path = args
-        .next()
-        .ok_or(ModifyUsbError::ArgMissing("control socket path"))?;
-    let socket_path = Path::new(&socket_path);
+fn usb_list(cmd: crosvm::UsbListCommand) -> ModifyUsbResult<UsbControlResult> {
+    let socket_path = Path::new(&cmd.socket_path);
     do_usb_list(socket_path)
 }
 
 fn modify_usb(cmd: crosvm::UsbCommand) -> std::result::Result<(), ()> {
-    let mut args = cmd.args;
-    if args.len() < 2 {
-        print_help("crosvm usb",
-                   "[attach BUS_ID:ADDR:VENDOR_ID:PRODUCT_ID [USB_DEVICE_PATH|-] | detach PORT | list] VM_SOCKET...", &[]);
-        return Err(());
-    }
-
-    // This unwrap will not panic because of the above length check.
-    let command = args.remove(0);
-    let result = match command.as_ref() {
-        "attach" => usb_attach(args),
-        "detach" => usb_detach(args),
-        "list" => usb_list(args),
-        other => Err(ModifyUsbError::UnknownCommand(other.to_owned())),
+    let result = match cmd.command {
+        crosvm::UsbSubCommand::Attach(cmd) => usb_attach(cmd),
+        crosvm::UsbSubCommand::Detach(cmd) => usb_detach(cmd),
+        crosvm::UsbSubCommand::List(cmd) => usb_list(cmd),
     };
     match result {
         Ok(response) => {

@@ -662,10 +662,6 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't use virtio-balloon device in the guest
     pub no_balloon: bool,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[argh(switch)]
-    /// don't use legacy KBD devices emulation
-    pub no_i8042: bool,
     #[cfg(unix)]
     #[argh(switch)]
     /// don't use legacy KBD/RTC devices emulation
@@ -673,10 +669,6 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't create RNG device in the guest
     pub no_rng: bool,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[argh(switch)]
-    /// don't use legacy RTC devices emulation
-    pub no_rtc: bool,
     #[argh(switch)]
     /// don't use SMT in the guest
     pub no_smt: bool,
@@ -1093,6 +1085,10 @@ pub struct RunCommand {
     #[argh(option, long = "trackpad", arg_name = "PATH:WIDTH:HEIGHT")]
     /// path to a socket from where to read trackpad input events and write status updates to, optionally followed by screen width and height (defaults to 800x1280)
     pub virtio_trackpad: Vec<TouchDeviceOption>,
+    #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
+    #[argh(switch)]
+    /// enable the virtio-tpm connection to vtpm daemon
+    pub vtpm_proxy: bool,
     #[argh(
         option,
         arg_name = "SOCKET_PATH[,addr=DOMAIN:BUS:DEVICE.FUNCTION,uuid=UUID]"
@@ -1372,6 +1368,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.software_tpm = cmd.software_tpm;
         }
 
+        #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
+        {
+            cfg.vtpm_proxy = cmd.vtpm_proxy;
+        }
+
         cfg.virtio_single_touch = cmd.virtio_single_touch;
         cfg.virtio_multi_touch = cmd.virtio_multi_touch;
         cfg.virtio_trackpad = cmd.virtio_trackpad;
@@ -1428,8 +1429,7 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(unix)]
         {
-            cfg.no_i8042 = cmd.no_legacy;
-            cfg.no_rtc = cmd.no_legacy;
+            cfg.no_legacy = cmd.no_legacy;
 
             if cmd.vhost_vsock_device.is_some() && cmd.vhost_vsock_fd.is_some() {
                 return Err(
@@ -1536,8 +1536,6 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.force_s2idle = cmd.s2idle;
             cfg.pcie_ecam = cmd.pcie_ecam;
             cfg.pci_low_start = cmd.pci_low_start;
-            cfg.no_i8042 = cmd.no_i8042;
-            cfg.no_rtc = cmd.no_rtc;
 
             for (index, msr_config) in cmd.userspace_msr {
                 if cfg.userspace_msr.insert(index, msr_config).is_some() {

@@ -23,6 +23,7 @@ use std::process;
 #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
 use std::thread;
 
+use devices::virtio::BalloonMode;
 use libc;
 
 use acpi_tables::sdt::SDT;
@@ -307,6 +308,13 @@ fn create_virtio_devices(
         }
     }
 
+    #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
+    {
+        if cfg.vtpm_proxy {
+            devs.push(create_vtpm_proxy_device(&cfg.jail_config)?);
+        }
+    }
+
     for (idx, single_touch_spec) in cfg.virtio_single_touch.iter().enumerate() {
         devs.push(create_single_touch_device(
             cfg.protected_vm,
@@ -373,7 +381,11 @@ fn create_virtio_devices(
         devs.push(create_balloon_device(
             cfg.protected_vm,
             &cfg.jail_config,
-            cfg.strict_balloon,
+            if cfg.strict_balloon {
+                BalloonMode::Strict
+            } else {
+                BalloonMode::Relaxed
+            },
             balloon_device_tube,
             balloon_inflate_tube,
             init_balloon_size,
@@ -1024,8 +1036,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
         gdb: None,
         dmi_path: cfg.dmi_path.clone(),
-        no_i8042: cfg.no_i8042,
-        no_rtc: cfg.no_rtc,
+        no_legacy: cfg.no_legacy,
         host_cpu_topology: cfg.host_cpu_topology,
         itmt: cfg.itmt,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1400,9 +1411,15 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
+        use devices::CrosvmDeviceId;
+        let irq_event_source = IrqEventSource {
+            device_id: CrosvmDeviceId::DirectIo.into(),
+            queue_id: 0,
+            device_name: format!("direct edge irq {}", irq),
+        };
         let irq_evt = devices::IrqLevelEvent::new().context("failed to create event")?;
         irq_chip
-            .register_level_irq_event(*irq, &irq_evt, IrqEventSource::empty())
+            .register_level_irq_event(*irq, &irq_evt, irq_event_source)
             .unwrap();
         let direct_irq = devices::DirectIrq::new_level(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
@@ -1417,9 +1434,15 @@ where
         if !sys_allocator.reserve_irq(*irq) {
             warn!("irq {} already reserved.", irq);
         }
+        use devices::CrosvmDeviceId;
+        let irq_event_source = IrqEventSource {
+            device_id: CrosvmDeviceId::DirectIo.into(),
+            queue_id: 0,
+            device_name: format!("direct level irq {}", irq),
+        };
         let irq_evt = devices::IrqEdgeEvent::new().context("failed to create event")?;
         irq_chip
-            .register_edge_irq_event(*irq, &irq_evt, IrqEventSource::empty())
+            .register_edge_irq_event(*irq, &irq_evt, irq_event_source)
             .unwrap();
         let direct_irq = devices::DirectIrq::new_edge(&irq_evt)
             .context("failed to enable interrupt forwarding")?;
@@ -1592,7 +1615,7 @@ where
             linux
                 .io_bus
                 .insert_sync(direct_io.clone(), range.base, range.len)
-                .unwrap();
+                .context("Error with pmio")?;
         }
     };
 
@@ -1607,7 +1630,7 @@ where
             linux
                 .mmio_bus
                 .insert_sync(direct_mmio.clone(), range.base, range.len)
-                .unwrap();
+                .context("Error with mmio")?;
         }
     };
 

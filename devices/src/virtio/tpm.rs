@@ -4,18 +4,17 @@
 
 use std::io::{self, Read, Write};
 use std::ops::BitOrAssign;
-use std::sync::Arc;
 use std::thread;
 
 use base::{error, Event, EventToken, RawDescriptor, WaitContext};
+use hypervisor::ProtectionType;
 use remain::sorted;
-use sync::Mutex;
 use thiserror::Error;
 use vm_memory::GuestMemory;
 
 use super::{
-    DescriptorChain, DescriptorError, DeviceType, Interrupt, Queue, Reader, SignalableInterrupt,
-    VirtioDevice, Writer,
+    base_features, DescriptorChain, DescriptorError, DeviceType, Interrupt, Queue, Reader,
+    SignalableInterrupt, VirtioDevice, Writer,
 };
 
 // A single queue of size 2. The guest kernel driver will enqueue a single
@@ -35,7 +34,7 @@ struct Worker {
     mem: GuestMemory,
     queue_evt: Event,
     kill_evt: Event,
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    backend: Box<dyn TpmBackend>,
 }
 
 pub trait TpmBackend: Send {
@@ -57,9 +56,7 @@ impl Worker {
         let mut command = vec![0u8; available_bytes];
         reader.read_exact(&mut command).map_err(Error::Read)?;
 
-        let mut backend = self.backend.lock();
-
-        let response = backend.execute_command(&command);
+        let response = self.backend.execute_command(&command);
 
         if response.len() > TPM_BUFSIZE {
             return Err(Error::ResponseTooLong {
@@ -162,15 +159,15 @@ impl Worker {
 
 /// Virtio vTPM device.
 pub struct Tpm {
-    backend: Arc<Mutex<dyn TpmBackend>>,
+    backend: Option<Box<dyn TpmBackend>>,
     kill_evt: Option<Event>,
     worker_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Tpm {
-    pub fn new(backend: Arc<Mutex<dyn TpmBackend>>) -> Tpm {
+    pub fn new(backend: Box<dyn TpmBackend>) -> Tpm {
         Tpm {
-            backend,
+            backend: Some(backend),
             kill_evt: None,
             worker_thread: None,
         }
@@ -202,6 +199,10 @@ impl VirtioDevice for Tpm {
         QUEUE_SIZES
     }
 
+    fn features(&self) -> u64 {
+        base_features(ProtectionType::Unprotected)
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemory,
@@ -215,7 +216,13 @@ impl VirtioDevice for Tpm {
         let queue = queues.remove(0);
         let queue_evt = queue_evts.remove(0);
 
-        let backend = self.backend.clone();
+        let backend = match self.backend.take() {
+            Some(backend) => backend,
+            None => {
+                error!("no backend in vtpm");
+                return;
+            }
+        };
 
         let (self_kill_evt, kill_evt) = match Event::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,

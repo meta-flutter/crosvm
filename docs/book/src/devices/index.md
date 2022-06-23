@@ -26,8 +26,9 @@ Here is a (non-comprehensive) list of emulated devices provided by crosvm.
 - [`pmem`] - Persistent memory.
 - [`rng`] - Entropy source used to seed guest OS's entropy pool.
 - [`snd`] - Encodes and decodes audio streams.
-- [`tpm`] - Creates a TPM (Trusted Platform Module) device backed by libtpm2 simulator.
-- [`video`] - Encodes and decodes video streams.
+- [`tpm`] - Creates a TPM (Trusted Platform Module) device backed by libtpm2 simulator or vTPM
+  daemon.
+- [`video`] - Allows the guest to leverage the host's video capabilities.
 - [`wayland`] - Allows the guest to use the host's Wayland socket.
 - [`vsock`] - Enables use of virtual sockets for the guest.
 - [`vhost-user`] - VirtIO devices which offloads the device implementation to another process
@@ -55,6 +56,6 @@ Here is a (non-comprehensive) list of emulated devices provided by crosvm.
 [`snd`]: https://chromium.googlesource.com/chromiumos/platform/crosvm/+/refs/heads/main/devices/src/virtio/snd/
 [`tpm`]: https://chromium.googlesource.com/chromiumos/platform/crosvm/+/refs/heads/main/devices/src/virtio/tpm.rs
 [`vhost-user`]: vhost_user.md
-[`video`]: https://chromium.googlesource.com/chromiumos/platform/crosvm/+/refs/heads/main/devices/src/virtio/video/
+[`video`]: video.md
 [`vsock`]: https://chromium.googlesource.com/chromiumos/platform/crosvm/+/refs/heads/main/devices/src/virtio/vhost/vsock.rs
 [`wayland`]: wayland.md

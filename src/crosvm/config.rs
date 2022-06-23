@@ -1723,8 +1723,7 @@ pub struct Config {
     pub mmio_address_ranges: Vec<AddressRange>,
     pub net_vq_pairs: Option<u16>,
     pub netmask: Option<net::Ipv4Addr>,
-    pub no_i8042: bool,
-    pub no_rtc: bool,
+    pub no_legacy: bool,
     pub no_smt: bool,
     pub params: Vec<String>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1748,6 +1747,7 @@ pub struct Config {
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     pub shared_dirs: Vec<SharedDir>,
     pub socket_path: Option<PathBuf>,
+    #[cfg(feature = "tpm")]
     pub software_tpm: bool,
     #[cfg(feature = "audio")]
     pub sound: Option<PathBuf>,
@@ -1789,6 +1789,8 @@ pub struct Config {
     pub virtio_single_touch: Vec<TouchDeviceOption>,
     pub virtio_switches: Vec<PathBuf>,
     pub virtio_trackpad: Vec<TouchDeviceOption>,
+    #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
+    pub vtpm_proxy: bool,
     pub vvu_proxy: Vec<VvuOption>,
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
     pub x_display: Option<String>,
@@ -1854,8 +1856,7 @@ impl Default for Config {
             mmio_address_ranges: Vec::new(),
             net_vq_pairs: None,
             netmask: None,
-            no_i8042: false,
-            no_rtc: false,
+            no_legacy: false,
             no_smt: false,
             params: Vec::new(),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1878,6 +1879,7 @@ impl Default for Config {
             serial_parameters: BTreeMap::new(),
             shared_dirs: Vec::new(),
             socket_path: None,
+            #[cfg(feature = "tpm")]
             software_tpm: false,
             #[cfg(feature = "audio")]
             sound: None,
@@ -1919,6 +1921,8 @@ impl Default for Config {
             virtio_single_touch: Vec::new(),
             virtio_switches: Vec::new(),
             virtio_trackpad: Vec::new(),
+            #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
+            vtpm_proxy: false,
             vvu_proxy: Vec::new(),
             wayland_socket_paths: BTreeMap::new(),
             x_display: None,

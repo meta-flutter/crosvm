@@ -11,6 +11,8 @@
 - [Devices](./devices/index.md)
   - [Block](./devices/block.md)
   - [Network](./devices/net.md)
+  - [Balloon](./devices/balloon.md)
+  - [Pmem](./devices/pmem.md)
   - [Wayland](./devices/wayland.md)
   - [Vhost-user](./devices/vhost_user.md)
   - [VirtIO Vhost-user (VVU)](./devices/vvu.md)

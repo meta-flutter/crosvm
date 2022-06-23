@@ -6,9 +6,12 @@ cfg_if::cfg_if! {
     if #[cfg(unix)] {
         pub(crate) mod unix;
         use unix as platform;
+    } else if #[cfg(windows)] {
+        pub(crate) mod windows;
+        use windows as platform;
     } else {
         compile_error!("Unsupported platform");
     }
 }
 
-pub(crate) use platform::main::{cleanup, start_device};
+pub(crate) use platform::{descriptor_analysis, SystemStream};

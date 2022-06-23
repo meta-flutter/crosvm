@@ -4,11 +4,16 @@
 
 cfg_if::cfg_if! {
     if #[cfg(unix)] {
-        pub(crate) mod unix;
+        pub mod unix;
         use unix as platform;
+        pub use platform::{VmMsyncRequest, VmMsyncResponse, FsMappingRequest};
+    } else if #[cfg(windows)] {
+        pub mod windows;
+        pub use windows as platform;
     } else {
         compile_error!("Unsupported platform");
     }
 }
 
-pub(crate) use platform::main::{cleanup, start_device};
+pub use platform::handle_request;
+pub(crate) use platform::{kill_handle, raw_descriptor_from_path};

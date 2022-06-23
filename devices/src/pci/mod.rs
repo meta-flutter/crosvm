@@ -36,9 +36,9 @@ pub use self::pci_configuration::{
     PciCapabilityID, PciClassCode, PciConfiguration, PciDisplaySubclass, PciHeaderType,
     PciProgrammingInterface, PciSerialBusSubClass, PciSubclass, CAPABILITY_LIST_HEAD_OFFSET,
 };
-pub use self::pci_device::{BarRange, Error as PciDeviceError, PciDevice};
+pub use self::pci_device::{BarRange, Error as PciDeviceError, PciBus, PciDevice};
 pub use self::pci_root::{PciConfigIo, PciConfigMmio, PciRoot, PciVirtualConfigMmio};
-pub use self::pcie::{PciBridge, PcieHostRootPort, PcieRootPort};
+pub use self::pcie::{PciBridge, PcieHostPort, PcieRootPort};
 pub use self::pvpanic::{PvPanicCode, PvPanicPciDevice};
 pub use self::stub::{StubPciDevice, StubPciParameters};
 pub use self::vfio_pci::VfioPciDevice;

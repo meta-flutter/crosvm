@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::net;
-use std::ops::RangeInclusive;
 use std::os::unix::prelude::RawFd;
 use std::path::PathBuf;
 
@@ -38,8 +37,7 @@ use devices::SerialHardware;
 use devices::SerialParameters;
 use devices::StubPciParameters;
 use hypervisor::ProtectionType;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use resources::MemRegion;
+use resources::AddressRange;
 use vm_control::BatteryType;
 
 #[derive(FromArgs)]
@@ -652,7 +650,7 @@ pub struct RunCommand {
         from_str_fn(parse_mmio_address_range)
     )]
     /// MMIO address ranges
-    pub mmio_address_ranges: Option<Vec<RangeInclusive<u64>>>,
+    pub mmio_address_ranges: Option<Vec<AddressRange>>,
     #[cfg(unix)]
     #[argh(option, arg_name = "N")]
     /// virtio net virtual queue pairs. (default: 1)
@@ -664,6 +662,10 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't use virtio-balloon device in the guest
     pub no_balloon: bool,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[argh(switch)]
+    /// don't use legacy KBD devices emulation
+    pub no_i8042: bool,
     #[cfg(unix)]
     #[argh(switch)]
     /// don't use legacy KBD/RTC devices emulation
@@ -671,6 +673,10 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't create RNG device in the guest
     pub no_rng: bool,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[argh(switch)]
+    /// don't use legacy RTC devices emulation
+    pub no_rtc: bool,
     #[argh(switch)]
     /// don't use SMT in the guest
     pub no_smt: bool,
@@ -690,8 +696,8 @@ pub struct RunCommand {
         arg_name = "mmio_base,mmio_length",
         from_str_fn(parse_memory_region)
     )]
-    /// base and length for PCIE Enhanced Configuration Access Mechanism
-    pub pcie_ecam: Option<MemRegion>,
+    /// region for PCIe Enhanced Configuration Access Mechanism
+    pub pcie_ecam: Option<AddressRange>,
     #[cfg(feature = "direct")]
     #[argh(
         option,
@@ -907,7 +913,7 @@ pub struct RunCommand {
     /// path to put the control socket. If PATH is a directory, a name will be generated
     pub socket_path: Option<PathBuf>,
     #[cfg(feature = "tpm")]
-    #[argh(switch, long = "tpm")]
+    #[argh(switch)]
     /// enable a software emulated trusted platform module device
     pub software_tpm: bool,
     #[cfg(feature = "audio")]
@@ -1422,7 +1428,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(unix)]
         {
-            cfg.no_legacy = cmd.no_legacy;
+            cfg.no_i8042 = cmd.no_legacy;
+            cfg.no_rtc = cmd.no_legacy;
 
             if cmd.vhost_vsock_device.is_some() && cmd.vhost_vsock_fd.is_some() {
                 return Err(
@@ -1529,6 +1536,8 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.force_s2idle = cmd.s2idle;
             cfg.pcie_ecam = cmd.pcie_ecam;
             cfg.pci_low_start = cmd.pci_low_start;
+            cfg.no_i8042 = cmd.no_i8042;
+            cfg.no_rtc = cmd.no_rtc;
 
             for (index, msr_config) in cmd.userspace_msr {
                 if cfg.userspace_msr.insert(index, msr_config).is_some() {

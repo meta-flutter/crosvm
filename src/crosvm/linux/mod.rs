@@ -48,7 +48,7 @@ use devices::{HostBackendDeviceProvider, XhciController};
 use hypervisor::kvm::{Kvm, KvmVcpu, KvmVm};
 use hypervisor::{HypervisorCap, ProtectionType, Vm, VmCap};
 use minijail::{self, Minijail};
-use resources::{Alloc, SystemAllocator};
+use resources::{AddressRange, Alloc, SystemAllocator};
 use rutabaga_gfx::RutabagaGralloc;
 use sync::{Condvar, Mutex};
 use vm_control::*;
@@ -67,7 +67,7 @@ use arch::{
 use {
     crate::crosvm::config::HostPcieRootPortParameters,
     devices::{
-        IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip, PciBridge, PcieHostRootPort, PcieRootPort,
+        IrqChipX86_64 as IrqChipArch, KvmSplitIrqChip, PciBridge, PcieHostPort, PcieRootPort,
     },
     hypervisor::{VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
     x86_64::msr::get_override_msr_list,
@@ -680,9 +680,10 @@ fn create_file_backed_mappings(
             .build()
             .context("failed to map backing file for file-backed mapping")?;
 
+        let mapping_range = AddressRange::from_start_and_size(mapping.address, mapping.size)
+            .context("failed to convert to AddressRange")?;
         match resources.mmio_allocator_any().allocate_at(
-            mapping.address,
-            mapping.size,
+            mapping_range,
             Alloc::FileBacked(mapping.address),
             "file-backed mapping".to_owned(),
         ) {
@@ -770,7 +771,7 @@ fn create_pcie_root_port(
         // reserve the host pci BDF and create a virtual pcie RP with some attrs same as host
         for host_pcie in host_pcie_rp.iter() {
             let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
-            let pcie_host = PcieHostRootPort::new(host_pcie.host_path.as_path(), vm_device_tube)?;
+            let pcie_host = PcieHostPort::new(host_pcie.host_path.as_path(), vm_device_tube)?;
             let bus_range = pcie_host.get_bus_range();
             let mut slot_implemented = true;
             for i in bus_range.secondary..=bus_range.subordinate {
@@ -920,7 +921,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
         gdb: None,
         dmi_path: cfg.dmi_path.clone(),
-        no_legacy: cfg.no_legacy,
+        no_i8042: cfg.no_i8042,
+        no_rtc: cfg.no_rtc,
         host_cpu_topology: cfg.host_cpu_topology,
         itmt: cfg.itmt,
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2161,7 +2163,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                     },
                                 )
                                 .context(
-                                    "failed to add hotplug vfio-pci descriptor ot wait context",
+                                    "failed to add hotplug vfio-pci descriptor to wait context",
                                 )?;
                         }
                         control_tubes.append(&mut add_tubes);

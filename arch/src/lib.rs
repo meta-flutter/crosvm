@@ -24,8 +24,8 @@ use base::{syslog, AsRawDescriptor, AsRawDescriptors, Event, SendTube, Tube};
 use devices::virtio::VirtioDevice;
 use devices::{
     BarRange, Bus, BusDevice, BusDeviceObj, BusError, BusResumeDevice, HotPlugBus, IrqChip,
-    PciAddress, PciBus, PciDevice, PciDeviceError, PciInterruptPin, PciRoot, ProxyDevice,
-    SerialHardware, SerialParameters, VfioPlatformDevice,
+    IrqEventSource, PciAddress, PciBus, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
+    ProxyDevice, SerialHardware, SerialParameters, VfioPlatformDevice,
 };
 use hypervisor::{IoEventAddress, ProtectionType, Vm};
 use minijail::Minijail;
@@ -42,12 +42,18 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as GdbStubRegs;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use {
     devices::IrqChipAArch64 as IrqChipArch,
-    hypervisor::{Hypervisor as HypervisorArch, VcpuAArch64 as VcpuArch, VmAArch64 as VmArch},
+    hypervisor::{
+        Hypervisor as HypervisorArch, VcpuAArch64 as VcpuArch, VcpuInitAArch64 as VcpuInitArch,
+        VmAArch64 as VmArch,
+    },
 };
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use {
     devices::IrqChipX86_64 as IrqChipArch,
-    hypervisor::{HypervisorX86_64 as HypervisorArch, VcpuX86_64 as VcpuArch, VmX86_64 as VmArch},
+    hypervisor::{
+        HypervisorX86_64 as HypervisorArch, VcpuInitX86_64 as VcpuInitArch, VcpuX86_64 as VcpuArch,
+        VmX86_64 as VmArch,
+    },
     resources::AddressRange,
 };
 
@@ -142,6 +148,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub suspend_evt: Event,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub vcpu_count: usize,
+    pub vcpu_init: VcpuInitArch,
     /// If vcpus is None, then it's the responsibility of the vcpu thread to create vcpus.
     /// If it's Some, then `build_vm` already created the vcpus.
     pub vcpus: Option<Vec<Vcpu>>,
@@ -223,6 +230,7 @@ pub trait LinuxArch {
     /// * `hypervisor` - The `Hypervisor` that created the vcpu.
     /// * `irq_chip` - The `IrqChip` associated with this vm.
     /// * `vcpu` - The VCPU object to configure.
+    /// * `vcpu_init` - The data required to initialize VCPU registers and other state.
     /// * `vcpu_id` - The id of the given `vcpu`.
     /// * `num_cpus` - Number of virtual CPUs the guest will have.
     /// * `has_bios` - Whether the `VmImage` is a `Bios` image
@@ -235,6 +243,7 @@ pub trait LinuxArch {
         hypervisor: &dyn HypervisorArch,
         irq_chip: &mut dyn IrqChipArch,
         vcpu: &mut dyn VcpuArch,
+        vcpu_init: &VcpuInitArch,
         vcpu_id: usize,
         num_cpus: usize,
         has_bios: bool,
@@ -399,7 +408,7 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
         linux
             .irq_chip
             .as_irq_chip_mut()
-            .register_level_irq_event(gsi, &intx_event)
+            .register_level_irq_event(gsi, &intx_event, IrqEventSource::from_device(&device))
             .map_err(DeviceRegistrationError::RegisterIrqfd)?;
     }
 
@@ -481,7 +490,11 @@ pub fn generate_platform_bus(
                 let irq_evt =
                     devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
                 irq_chip
-                    .register_level_irq_event(irq_num, &irq_evt)
+                    .register_level_irq_event(
+                        irq_num,
+                        &irq_evt,
+                        IrqEventSource::from_device(&device),
+                    )
                     .map_err(DeviceRegistrationError::RegisterIrqfd)?;
                 device
                     .assign_level_platform_irq(&irq_evt, irq.index)
@@ -491,7 +504,11 @@ pub fn generate_platform_bus(
                 let irq_evt =
                     devices::IrqEdgeEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
                 irq_chip
-                    .register_edge_irq_event(irq_num, &irq_evt)
+                    .register_edge_irq_event(
+                        irq_num,
+                        &irq_evt,
+                        IrqEventSource::from_device(&device),
+                    )
                     .map_err(DeviceRegistrationError::RegisterIrqfd)?;
                 device
                     .assign_edge_platform_irq(&irq_evt, irq.index)
@@ -662,7 +679,7 @@ pub fn generate_pci_root(
                 resources.reserve_irq(gsi);
             };
             irq_chip
-                .register_level_irq_event(gsi, &intx_event)
+                .register_level_irq_event(gsi, &intx_event, IrqEventSource::from_device(device))
                 .map_err(DeviceRegistrationError::RegisterIrqfd)?;
 
             pci_irqs.push((device_addrs[dev_idx], gsi, pin));
@@ -755,12 +772,6 @@ pub fn add_goldfish_battery(
         )
         .map_err(DeviceRegistrationError::AllocateIoResource)?;
 
-    let irq_evt = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
-
-    irq_chip
-        .register_level_irq_event(irq_num, &irq_evt)
-        .map_err(DeviceRegistrationError::RegisterIrqfd)?;
-
     let (control_tube, response_tube) =
         Tube::pair().map_err(DeviceRegistrationError::CreateTube)?;
 
@@ -771,10 +782,27 @@ pub fn add_goldfish_battery(
     #[cfg(not(feature = "power-monitor-powerd"))]
     let create_monitor = None;
 
-    let goldfish_bat =
-        devices::GoldfishBattery::new(mmio_base, irq_num, irq_evt, response_tube, create_monitor)
-            .map_err(DeviceRegistrationError::RegisterBattery)?;
+    let irq_evt = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
+
+    let goldfish_bat = devices::GoldfishBattery::new(
+        mmio_base,
+        irq_num,
+        irq_evt
+            .try_clone()
+            .map_err(DeviceRegistrationError::EventClone)?,
+        response_tube,
+        create_monitor,
+    )
+    .map_err(DeviceRegistrationError::RegisterBattery)?;
     goldfish_bat.to_aml_bytes(amls);
+
+    irq_chip
+        .register_level_irq_event(
+            irq_num,
+            &irq_evt,
+            IrqEventSource::from_device(&goldfish_bat),
+        )
+        .map_err(DeviceRegistrationError::RegisterIrqfd)?;
 
     match battery_jail.as_ref() {
         Some(jail) => {

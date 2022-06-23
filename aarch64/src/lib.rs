@@ -17,11 +17,12 @@ use arch::{
 use base::{Event, MemoryMappingBuilder, SendTube};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
-    Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, PciAddress, PciConfigMmio, PciDevice,
+    Bus, BusDeviceObj, BusError, IrqChip, IrqChipAArch64, IrqEventSource, PciAddress,
+    PciConfigMmio, PciDevice, Serial,
 };
 use hypervisor::{
     DeviceKind, Hypervisor, HypervisorCap, ProtectionType, VcpuAArch64, VcpuFeature,
-    VcpuRegAArch64, Vm, VmAArch64,
+    VcpuInitAArch64, VcpuRegAArch64, Vm, VmAArch64,
 };
 use minijail::Minijail;
 use remain::sorted;
@@ -429,11 +430,16 @@ impl arch::LinuxArch for AArch64 {
         )
         .map_err(Error::CreateSerialDevices)?;
 
+        let source = IrqEventSource {
+            device_id: Serial::device_id(),
+            queue_id: 0,
+            device_name: Serial::debug_label(),
+        };
         irq_chip
-            .register_edge_irq_event(AARCH64_SERIAL_1_3_IRQ, &com_evt_1_3)
+            .register_edge_irq_event(AARCH64_SERIAL_1_3_IRQ, &com_evt_1_3, source.clone())
             .map_err(Error::RegisterIrqfd)?;
         irq_chip
-            .register_edge_irq_event(AARCH64_SERIAL_2_4_IRQ, &com_evt_2_4)
+            .register_edge_irq_event(AARCH64_SERIAL_2_4_IRQ, &com_evt_2_4, source)
             .map_err(Error::RegisterIrqfd)?;
 
         mmio_bus
@@ -522,6 +528,7 @@ impl arch::LinuxArch for AArch64 {
             vm,
             vcpu_count,
             vcpus: Some(vcpus),
+            vcpu_init: VcpuInitAArch64 {},
             vcpu_affinity: components.vcpu_affinity,
             no_smt: components.no_smt,
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
@@ -545,6 +552,7 @@ impl arch::LinuxArch for AArch64 {
         _hypervisor: &dyn Hypervisor,
         _irq_chip: &mut dyn IrqChipAArch64,
         _vcpu: &mut dyn VcpuAArch64,
+        _vcpu_init: &VcpuInitAArch64,
         _vcpu_id: usize,
         _num_cpus: usize,
         _has_bios: bool,
@@ -622,13 +630,17 @@ impl AArch64 {
     /// * `bus` - The bus to add devices to.
     fn add_arch_devs(irq_chip: &mut dyn IrqChip, bus: &Bus) -> Result<()> {
         let rtc_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
+        let rtc = devices::pl030::Pl030::new(rtc_evt.try_clone().map_err(Error::CloneEvent)?);
         irq_chip
-            .register_edge_irq_event(AARCH64_RTC_IRQ, &rtc_evt)
+            .register_edge_irq_event(AARCH64_RTC_IRQ, &rtc_evt, IrqEventSource::from_device(&rtc))
             .map_err(Error::RegisterIrqfd)?;
 
-        let rtc = Arc::new(Mutex::new(devices::pl030::Pl030::new(rtc_evt)));
-        bus.insert(rtc, AARCH64_RTC_ADDR, AARCH64_RTC_SIZE)
-            .expect("failed to add rtc device");
+        bus.insert(
+            Arc::new(Mutex::new(rtc)),
+            AARCH64_RTC_ADDR,
+            AARCH64_RTC_SIZE,
+        )
+        .expect("failed to add rtc device");
 
         Ok(())
     }

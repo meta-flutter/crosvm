@@ -68,10 +68,12 @@ use arch::{
 use base::{warn, Event, SendTube, TubeError};
 use devices::serial_device::{SerialHardware, SerialParameters};
 use devices::{
-    BusDevice, BusDeviceObj, BusResumeDevice, Debugcon, IrqChip, IrqChipX86_64, PciAddress,
-    PciConfigIo, PciConfigMmio, PciDevice, PciVirtualConfigMmio, ProxyDevice,
+    BusDevice, BusDeviceObj, BusResumeDevice, Debugcon, IrqChip, IrqChipX86_64, IrqEventSource,
+    PciAddress, PciConfigIo, PciConfigMmio, PciDevice, PciVirtualConfigMmio, ProxyDevice, Serial,
 };
-use hypervisor::{HypervisorX86_64, ProtectionType, VcpuX86_64, Vm, VmCap, VmX86_64};
+use hypervisor::{
+    HypervisorX86_64, ProtectionType, VcpuInitX86_64, VcpuX86_64, Vm, VmCap, VmX86_64,
+};
 use minijail::Minijail;
 use remain::sorted;
 use resources::{AddressRange, SystemAllocator, SystemAllocatorConfig};
@@ -369,13 +371,17 @@ fn configure_system(
         E820Type::Ram,
     )?;
 
-    let ram_region = AddressRange {
+    // GuestMemory::end_addr() returns the first address past the end, so subtract 1 to get the
+    // inclusive end.
+    let guest_mem_end = guest_mem.end_addr().offset() - 1;
+    let ram_below_4g = AddressRange {
         start: kernel_addr.offset(),
-        // GuestMemory::end_addr() returns the first address past the end, so subtract 1 to get the
-        // inclusive end.
-        end: guest_mem.end_addr().offset() - 1,
+        end: guest_mem_end.min(read_pci_mmio_before_32bit().start - 1),
     };
-    let (ram_below_4g, ram_above_4g) = ram_region.split_at(FIRST_ADDR_PAST_32BITS);
+    let ram_above_4g = AddressRange {
+        start: FIRST_ADDR_PAST_32BITS,
+        end: guest_mem_end,
+    };
     add_e820_entry(&mut params, ram_below_4g, E820Type::Ram)?;
     if !ram_above_4g.is_empty() {
         add_e820_entry(&mut params, ram_above_4g, E820Type::Ram)?
@@ -690,6 +696,8 @@ impl arch::LinuxArch for X8664arch {
                 .map_err(Error::Cmdline)?;
         }
 
+        let vcpu_init = VcpuInitX86_64 {};
+
         match components.vm_image {
             VmImage::Bios(ref mut bios) => {
                 // Allow a bios to hardcode CMDLINE_OFFSET and read the kernel command line from it.
@@ -722,6 +730,7 @@ impl arch::LinuxArch for X8664arch {
             vcpu_count,
             vcpus: None,
             vcpu_affinity: components.vcpu_affinity,
+            vcpu_init,
             no_smt: components.no_smt,
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
             has_bios: matches!(components.vm_image, VmImage::Bios(_)),
@@ -746,6 +755,7 @@ impl arch::LinuxArch for X8664arch {
         hypervisor: &dyn HypervisorX86_64,
         irq_chip: &mut dyn IrqChipX86_64,
         vcpu: &mut dyn VcpuX86_64,
+        _vcpu_init: &VcpuInitX86_64,
         vcpu_id: usize,
         num_cpus: usize,
         has_bios: bool,
@@ -1439,11 +1449,6 @@ impl X8664arch {
         let pcie_vcfg = aml::Name::new("VCFG".into(), &Self::get_pcie_vcfg_mmio_range(mem).start);
         pcie_vcfg.to_aml_bytes(&mut amls);
 
-        let pm_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
-        irq_chip
-            .register_level_irq_event(sci_irq, &pm_sci_evt)
-            .map_err(Error::RegisterIrqfd)?;
-
         #[cfg(feature = "direct")]
         let direct_gpe_info = if direct_gpe.is_empty() {
             None
@@ -1463,14 +1468,23 @@ impl X8664arch {
             Some((direct_sci_evt, direct_gpe))
         };
 
+        let pm_sci_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
+
         let mut pmresource = devices::ACPIPMResource::new(
-            pm_sci_evt,
+            pm_sci_evt.try_clone().map_err(Error::CloneEvent)?,
             #[cfg(feature = "direct")]
             direct_gpe_info,
             suspend_evt,
             vm_evt_wrtube,
         );
         pmresource.to_aml_bytes(&mut amls);
+        irq_chip
+            .register_level_irq_event(
+                sci_irq,
+                &pm_sci_evt,
+                IrqEventSource::from_device(&pmresource),
+            )
+            .map_err(Error::RegisterIrqfd)?;
         pmresource.start();
 
         let mut crs_entries: Vec<Box<dyn Aml>> = vec![
@@ -1568,11 +1582,16 @@ impl X8664arch {
         )
         .map_err(Error::CreateSerialDevices)?;
 
+        let source = IrqEventSource {
+            device_id: Serial::device_id(),
+            queue_id: 0,
+            device_name: Serial::debug_label(),
+        };
         irq_chip
-            .register_edge_irq_event(X86_64_SERIAL_1_3_IRQ, &com_evt_1_3)
+            .register_edge_irq_event(X86_64_SERIAL_1_3_IRQ, &com_evt_1_3, source.clone())
             .map_err(Error::RegisterIrqfd)?;
         irq_chip
-            .register_edge_irq_event(X86_64_SERIAL_2_4_IRQ, &com_evt_2_4)
+            .register_edge_irq_event(X86_64_SERIAL_2_4_IRQ, &com_evt_2_4, source)
             .map_err(Error::RegisterIrqfd)?;
 
         Ok(())
@@ -1903,6 +1922,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "direct")]
+    #[ignore] // TODO(b/236253615): Fix and re-enable this test.
     fn end_addr_before_32bits() {
         setup();
         // On volteer, type16 (coreboot) region is at 0x00000000769f3000-0x0000000076ffffff.

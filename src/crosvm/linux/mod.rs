@@ -304,14 +304,20 @@ fn create_virtio_devices(
     #[cfg(feature = "tpm")]
     {
         if cfg.software_tpm {
-            devs.push(create_software_tpm_device(&cfg.jail_config)?);
+            devs.push(create_software_tpm_device(
+                cfg.protected_vm,
+                &cfg.jail_config,
+            )?);
         }
     }
 
     #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
     {
         if cfg.vtpm_proxy {
-            devs.push(create_vtpm_proxy_device(&cfg.jail_config)?);
+            devs.push(create_vtpm_proxy_device(
+                cfg.protected_vm,
+                &cfg.jail_config,
+            )?);
         }
     }
 
@@ -730,8 +736,13 @@ fn create_devices(
     for stub in stubs {
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-        let dev = VirtioPciDevice::new(vm.get_memory().clone(), stub.dev, msi_device_tube)
-            .context("failed to create virtio pci dev")?;
+        let dev = VirtioPciDevice::new(
+            vm.get_memory().clone(),
+            stub.dev,
+            msi_device_tube,
+            cfg.disable_virtio_intx,
+        )
+        .context("failed to create virtio pci dev")?;
         let dev = Box::new(dev) as Box<dyn BusDeviceObj>;
         devices.push((dev, stub.jail));
     }
@@ -1547,8 +1558,13 @@ where
 
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         control_tubes.push(TaggedControlTube::VmIrq(msi_host_tube));
-        let mut dev = VirtioPciDevice::new(vm.get_memory().clone(), iommu_dev.dev, msi_device_tube)
-            .context("failed to create virtio pci dev")?;
+        let mut dev = VirtioPciDevice::new(
+            vm.get_memory().clone(),
+            iommu_dev.dev,
+            msi_device_tube,
+            cfg.disable_virtio_intx,
+        )
+        .context("failed to create virtio pci dev")?;
         // early reservation for viommu.
         dev.allocate_address(&mut sys_allocator)
             .context("failed to allocate resources early for virtio pci dev")?;

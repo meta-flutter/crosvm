@@ -499,8 +499,12 @@ pub struct RunCommand {
     #[argh(switch)]
     /// run all devices in one, non-sandboxed process
     pub disable_sandbox: bool,
+    #[argh(switch)]
+    /// disable INTx in virtio devices
+    pub disable_virtio_intx: bool,
     #[argh(
         option,
+        short = 'd',
         long = "disk",
         arg_name = "PATH[,key=value[,key=value[,...]]",
         from_str_fn(numbered_disk_option)
@@ -1578,6 +1582,8 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.pcie_rp = cmd.pcie_rp;
             cfg.mmio_address_ranges = cmd.mmio_address_ranges.unwrap_or_default();
         }
+
+        cfg.disable_virtio_intx = cmd.disable_virtio_intx;
 
         cfg.dmi_path = cmd.dmi_path;
 

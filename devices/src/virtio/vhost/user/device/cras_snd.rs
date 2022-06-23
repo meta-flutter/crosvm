@@ -88,10 +88,13 @@ impl CrasSndBackend {
 }
 
 impl VhostUserBackend for CrasSndBackend {
-    const MAX_QUEUE_NUM: usize = MAX_QUEUE_NUM;
-    const MAX_VRING_LEN: u16 = MAX_VRING_LEN;
+    fn max_queue_num(&self) -> usize {
+        return MAX_QUEUE_NUM;
+    }
 
-    type Error = anyhow::Error;
+    fn max_vring_len(&self) -> u16 {
+        return MAX_VRING_LEN;
+    }
 
     fn features(&self) -> u64 {
         self.avail_features
@@ -265,7 +268,7 @@ pub fn run_cras_snd_device(opts: Options) -> anyhow::Result<()> {
     // Create and bind unix socket
     let listener = SocketListener::new(opts.socket, true /* unlink */)?;
 
-    let handler = DeviceRequestHandler::new(snd_device);
+    let handler = DeviceRequestHandler::new(Box::new(snd_device));
 
     // Child, we can continue by spawning the executor and set up the device
     let ex = Executor::new().context("Failed to create executor")?;

@@ -97,7 +97,7 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     let device = match opts.vfio {
         None => None,
         Some(vfio) => {
-            let d = VvuPciDevice::new(&vfio, FsBackend::MAX_QUEUE_NUM)?;
+            let d = VvuPciDevice::new(&vfio, fs_device.max_queue_num())?;
             keep_rds.extend(d.irqs.iter().map(|e| e.as_raw_descriptor()));
             keep_rds.extend(d.notification_evts.iter().map(|e| e.as_raw_descriptor()));
             keep_rds.push(d.vfio_dev.device_file().as_raw_fd());
@@ -106,7 +106,7 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     };
     base::syslog::push_descriptors(&mut keep_rds);
 
-    let handler = DeviceRequestHandler::new(fs_device);
+    let handler = DeviceRequestHandler::new(Box::new(fs_device));
 
     let pid = jail_and_fork(keep_rds, opts.shared_dir, opts.uid_map, opts.gid_map)?;
 

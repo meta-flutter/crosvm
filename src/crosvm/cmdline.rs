@@ -1,4 +1,4 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.,
+// Copyright 2022 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -600,7 +600,9 @@ pub struct RunCommand {
     ///        swapchain to draw on a window
     ///     cache-path=PATH - The path to the virtio-gpu device
     ///        shader cache.
-    ///     cache-size=SIZE - The maximum size of the shader cache
+    ///     cache-size=SIZE - The maximum size of the shader cache.
+    ///     pci-bar-size=SIZE - The size for the PCI BAR in bytes
+    ///        (default 8gb).
     pub gpu_params: Option<devices::virtio::GpuParameters>,
     #[cfg(all(unix, feature = "gpu", feature = "virgl_renderer_next"))]
     #[argh(option, from_str_fn(parse_gpu_render_server_options))]
@@ -691,7 +693,12 @@ pub struct RunCommand {
     /// base and length for PCIE Enhanced Configuration Access Mechanism
     pub pcie_ecam: Option<MemRegion>,
     #[cfg(feature = "direct")]
-    #[argh(option, long = "pcie-root-port", arg_name = "PATH[,hp_gpe=NUM]")]
+    #[argh(
+        option,
+        long = "pcie-root-port",
+        arg_name = "PATH[,hp_gpe=NUM]",
+        from_str_fn(parse_pcie_root_port_params)
+    )]
     /// path to sysfs of host pcie root port and host pcie root port hotplug gpe number
     pub pcie_rp: Vec<HostPcieRootPortParameters>,
     #[argh(switch)]
@@ -1047,7 +1054,7 @@ pub struct RunCommand {
         from_str_fn(parse_video_options)
     )]
     /// (EXPERIMENTAL) enable virtio-video decoder device
-    // Possible backend values: libvda
+    // Possible backend values: libvda, ffmpeg
     pub video_dec: Option<VideoBackendType>,
     #[cfg(feature = "video-encoder")]
     #[argh(
@@ -1551,7 +1558,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.direct_edge_irq = cmd.direct_edge_irq;
             cfg.direct_gpe = cmd.direct_gpe;
             cfg.pcie_rp = cmd.pcie_rp;
-            cfg.mmio_address_ranges = cmd.mmio_address_ranges;
+            cfg.mmio_address_ranges = cmd.mmio_address_ranges.unwrap_or_default();
         }
 
         cfg.dmi_path = cmd.dmi_path;

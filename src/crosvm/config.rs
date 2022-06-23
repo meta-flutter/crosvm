@@ -1,4 +1,4 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.,
+// Copyright 2022 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -703,6 +703,8 @@ pub fn parse_video_options(s: &str) -> Result<VideoBackendType, String> {
     const VALID_VIDEO_BACKENDS: &[&str] = &[
         #[cfg(feature = "libvda")]
         "libvda",
+        #[cfg(feature = "ffmpeg")]
+        "ffmpeg",
     ];
 
     match s {
@@ -710,6 +712,12 @@ pub fn parse_video_options(s: &str) -> Result<VideoBackendType, String> {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "libvda")] {
                     Ok(VideoBackendType::Libvda)
+                } else if #[cfg(feature = "ffmpeg")] {
+                    Ok(VideoBackendType::Ffmpeg)
+                } else {
+                    // Cannot be reached because at least one video backend needs to be enabled for
+                    // the decoder to be compiled.
+                    unreachable!()
                 }
             }
         }
@@ -717,6 +725,8 @@ pub fn parse_video_options(s: &str) -> Result<VideoBackendType, String> {
         "libvda" => Ok(VideoBackendType::Libvda),
         #[cfg(feature = "libvda")]
         "libvda-vd" => Ok(VideoBackendType::LibvdaVd),
+        #[cfg(feature = "ffmpeg")]
+        "ffmpeg" => Ok(VideoBackendType::Ffmpeg),
         _ => Err(invalid_value_err(
             s,
             format!("should be one of ({})", VALID_VIDEO_BACKENDS.join("|")),
@@ -934,6 +944,53 @@ pub fn parse_memory_region(value: &str) -> Result<MemRegion, String> {
     Ok(MemRegion { base, size: len })
 }
 
+#[cfg(feature = "direct")]
+pub fn parse_pcie_root_port_params(value: &str) -> Result<HostPcieRootPortParameters, String> {
+    let opts: Vec<_> = value.split(',').collect();
+    if opts.len() > 2 {
+        return Err(invalid_value_err(
+            value,
+            "pcie-root-port has maxmimum two arguments",
+        ));
+    }
+    let pcie_path = PathBuf::from(opts[0]);
+    if !pcie_path.exists() {
+        return Err(invalid_value_err(
+            value,
+            "the pcie root port path does not exist",
+        ));
+    }
+    if !pcie_path.is_dir() {
+        return Err(invalid_value_err(
+            value,
+            "the pcie root port path should be directory",
+        ));
+    }
+
+    let hp_gpe = if opts.len() == 2 {
+        let gpes: Vec<&str> = opts[1].split('=').collect();
+        if gpes.len() != 2 || gpes[0] != "hp_gpe" {
+            return Err(invalid_value_err(value, "it should be hp_gpe=Num"));
+        }
+        match gpes[1].parse::<u32>() {
+            Ok(gpe) => Some(gpe),
+            Err(_) => {
+                return Err(invalid_value_err(
+                    value,
+                    "host hp gpe must be a non-negative integer",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(HostPcieRootPortParameters {
+        host_path: pcie_path,
+        hp_gpe,
+    })
+}
+
 pub fn parse_bus_id_addr(v: &str) -> Result<(u8, u8, u16, u16), String> {
     debug!("parse_bus_id_addr: {}", v);
     let mut ids = v.split(':');
@@ -1119,7 +1176,7 @@ pub fn parse_direct_io_options(s: &str) -> Result<DirectIoOption, String> {
     if !path.exists() {
         return Err(invalid_value_err(parts[0], "the path does not exist"));
     };
-    let ranges: argument::Result<Vec<BusRange>> = parts[1]
+    let ranges: Result<Vec<BusRange>, String> = parts[1]
         .split(',')
         .map(|frag| frag.split('-'))
         .map(|mut range| {
@@ -1515,6 +1572,12 @@ pub fn parse_gpu_options(s: &str) -> Result<GpuParameters, String> {
             },
             "cache-path" => gpu_params.cache_path = Some(v.to_string()),
             "cache-size" => gpu_params.cache_size = Some(v.to_string()),
+            "pci-bar-size" => {
+                let size = parse_hex_or_decimal(v).map_err(|_| {
+                    "gpu parameter `pci-bar-size` must be a valid hex or decimal value"
+                })?;
+                gpu_params.pci_bar_size = size;
+            }
             "udmabuf" => match v {
                 "true" | "" => {
                     gpu_params.udmabuf = true;
@@ -1918,6 +1981,12 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
     #[cfg(feature = "gpu")]
     {
         if let Some(gpu_parameters) = cfg.gpu_parameters.as_mut() {
+            if !gpu_parameters.pci_bar_size.is_power_of_two() {
+                return Err(format!(
+                    "gpu parameter `pci-bar-size` must be a power of two but is {}",
+                    gpu_parameters.pci_bar_size
+                ));
+            }
             if gpu_parameters.displays.is_empty() {
                 gpu_parameters.displays.push(GpuDisplayParameters {
                     width: DEFAULT_DISPLAY_WIDTH,

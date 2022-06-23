@@ -152,22 +152,18 @@ pub fn create_guest_memory(
 }
 
 /// Trait for vhost-user backend.
-pub trait VhostUserBackend
-where
-    Self: Sized,
-    Self::Error: std::fmt::Display,
-{
-    const MAX_QUEUE_NUM: usize;
-    const MAX_VRING_LEN: u16;
+pub trait VhostUserBackend {
+    /// The maximum number of queues that this backend can manage.
+    fn max_queue_num(&self) -> usize;
 
-    /// Error type specific to this backend.
-    type Error;
+    /// The maximum length that virtqueues can take with this backend.
+    fn max_vring_len(&self) -> u16;
 
     /// The set of feature bits that this backend supports.
     fn features(&self) -> u64;
 
     /// Acknowledges that this set of features should be enabled.
-    fn ack_features(&mut self, value: u64) -> std::result::Result<(), Self::Error>;
+    fn ack_features(&mut self, value: u64) -> anyhow::Result<()>;
 
     /// Returns the set of enabled features.
     fn acked_features(&self) -> u64;
@@ -176,7 +172,7 @@ where
     fn protocol_features(&self) -> VhostUserProtocolFeatures;
 
     /// Acknowledges that this set of protocol features should be enabled.
-    fn ack_protocol_features(&mut self, _value: u64) -> std::result::Result<(), Self::Error>;
+    fn ack_protocol_features(&mut self, _value: u64) -> anyhow::Result<()>;
 
     /// Returns the set of enabled protocol features.
     fn acked_protocol_features(&self) -> u64;
@@ -188,10 +184,7 @@ where
     fn write_config(&self, _offset: u64, _data: &[u8]) {}
 
     /// Sets the channel for device-specific communication.
-    fn set_device_request_channel(
-        &mut self,
-        _channel: File,
-    ) -> std::result::Result<(), Self::Error> {
+    fn set_device_request_channel(&mut self, _channel: File) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -205,7 +198,7 @@ where
         mem: GuestMemory,
         doorbell: Arc<Mutex<Doorbell>>,
         kick_evt: Event,
-    ) -> std::result::Result<(), Self::Error>;
+    ) -> anyhow::Result<()>;
 
     /// Indicates that the backend should stop processing requests for virtio queue number `idx`.
     fn stop_queue(&mut self, idx: usize);
@@ -289,28 +282,22 @@ impl Default for HandlerType {
 }
 
 /// Structure to have an event loop for interaction between a VMM and `VhostUserBackend`.
-pub struct DeviceRequestHandler<B>
-where
-    B: 'static + VhostUserBackend,
-{
+pub struct DeviceRequestHandler {
     vrings: Vec<Vring>,
     owned: bool,
     vmm_maps: Option<Vec<MappingInfo>>,
     mem: Option<GuestMemory>,
-    backend: B,
+    backend: Box<dyn VhostUserBackend>,
 
     handler_type: HandlerType,
 }
 
-impl<B> DeviceRequestHandler<B>
-where
-    B: 'static + VhostUserBackend,
-{
+impl DeviceRequestHandler {
     /// Creates the vhost-user handler instance for `backend`.
-    pub fn new(backend: B) -> Self {
-        let mut vrings = Vec::with_capacity(B::MAX_QUEUE_NUM);
-        for _ in 0..B::MAX_QUEUE_NUM {
-            vrings.push(Vring::new(B::MAX_VRING_LEN as u16));
+    pub fn new(backend: Box<dyn VhostUserBackend>) -> Self {
+        let mut vrings = Vec::with_capacity(backend.max_queue_num());
+        for _ in 0..backend.max_queue_num() {
+            vrings.push(Vring::new(backend.max_vring_len() as u16));
         }
 
         DeviceRequestHandler {
@@ -324,7 +311,7 @@ where
     }
 }
 
-impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B> {
+impl VhostUserSlaveReqHandlerMut for DeviceRequestHandler {
     fn protocol(&self) -> Protocol {
         match &self.handler_type {
             HandlerType::VhostUser => Protocol::Regular,
@@ -420,7 +407,10 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> VhostResult<()> {
-        if index as usize >= self.vrings.len() || num == 0 || num > B::MAX_VRING_LEN.into() {
+        if index as usize >= self.vrings.len()
+            || num == 0
+            || num > self.backend.max_vring_len().into()
+        {
             return Err(VhostError::InvalidParam);
         }
         self.vrings[index as usize].queue.size = num as u16;
@@ -451,7 +441,7 @@ impl<B: VhostUserBackend> VhostUserSlaveReqHandlerMut for DeviceRequestHandler<B
     }
 
     fn set_vring_base(&mut self, index: u32, base: u32) -> VhostResult<()> {
-        if index as usize >= self.vrings.len() || base >= B::MAX_VRING_LEN.into() {
+        if index as usize >= self.vrings.len() || base >= self.backend.max_vring_len().into() {
             return Err(VhostError::InvalidParam);
         }
 
@@ -684,6 +674,9 @@ mod tests {
     }
 
     impl FakeBackend {
+        const MAX_QUEUE_NUM: usize = 16;
+        const MAX_VRING_LEN: u16 = 256;
+
         pub(super) fn new() -> Self {
             Self {
                 avail_features: VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
@@ -694,16 +687,19 @@ mod tests {
     }
 
     impl VhostUserBackend for FakeBackend {
-        const MAX_QUEUE_NUM: usize = 16;
-        const MAX_VRING_LEN: u16 = 256;
+        fn max_queue_num(&self) -> usize {
+            Self::MAX_QUEUE_NUM
+        }
 
-        type Error = anyhow::Error;
+        fn max_vring_len(&self) -> u16 {
+            Self::MAX_VRING_LEN
+        }
 
         fn features(&self) -> u64 {
             self.avail_features
         }
 
-        fn ack_features(&mut self, value: u64) -> std::result::Result<(), Self::Error> {
+        fn ack_features(&mut self, value: u64) -> anyhow::Result<()> {
             let unrequested_features = value & !self.avail_features;
             if unrequested_features != 0 {
                 bail!(
@@ -723,7 +719,7 @@ mod tests {
             VhostUserProtocolFeatures::CONFIG
         }
 
-        fn ack_protocol_features(&mut self, features: u64) -> std::result::Result<(), Self::Error> {
+        fn ack_protocol_features(&mut self, features: u64) -> anyhow::Result<()> {
             let features = VhostUserProtocolFeatures::from_bits(features).ok_or(anyhow!(
                 "invalid protocol features are given: 0x{:x}",
                 features
@@ -750,7 +746,7 @@ mod tests {
             _mem: GuestMemory,
             _doorbell: Arc<Mutex<Doorbell>>,
             _kick_evt: Event,
-        ) -> std::result::Result<(), Self::Error> {
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -825,7 +821,8 @@ mod tests {
         });
 
         // Device side
-        let handler = std::sync::Mutex::new(DeviceRequestHandler::new(FakeBackend::new()));
+        let handler =
+            std::sync::Mutex::new(DeviceRequestHandler::new(Box::new(FakeBackend::new())));
         let mut listener = SlaveListener::<SocketEndpoint<_>, _>::new(listener, handler).unwrap();
 
         // Notify listener is ready.

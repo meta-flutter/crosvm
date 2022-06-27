@@ -92,7 +92,6 @@ impl PciBridge {
             .lock()
             .get_bus_range()
             .expect("PciBridge's backend device must implement get_bus_range()");
-
         let data = [
             bus_range.primary,
             bus_range.secondary,
@@ -100,17 +99,15 @@ impl PciBridge {
             0,
         ];
         config.write_reg(BR_BUS_NUMBER_REG, 0, &data[..]);
-        let pci_bus = Arc::new(Mutex::new(PciBus::new(
-            bus_range.secondary,
-            bus_range.primary,
-            device.lock().hotplug_implemented(),
-        )));
 
         PciBridge {
             device,
             config,
             pci_address: None,
-            pci_bus,
+            pci_bus: Arc::new(Mutex::new(PciBus::new(
+                bus_range.secondary,
+                bus_range.primary,
+            ))),
             bus_range,
             msi_config,
             msi_cap_offset,

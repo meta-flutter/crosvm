@@ -5,7 +5,7 @@ import argparse
 import platform
 import subprocess
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, Optional, cast, List, Dict
 import typing
 import sys
 from . import testvm
@@ -63,9 +63,9 @@ class Ssh:
     """Wrapper around subprocess to execute commands remotely via SSH."""
 
     hostname: str
-    opts: list[str]
+    opts: List[str]
 
-    def __init__(self, hostname: str, opts: list[str] = []):
+    def __init__(self, hostname: str, opts: List[str] = []):
         self.hostname = hostname
         self.opts = opts
 
@@ -95,9 +95,9 @@ class Ssh:
             check=True,
         ).stdout
 
-    def upload_files(self, files: list[Path], remote_dir: str = "", quiet: bool = False):
+    def upload_files(self, files: List[Path], remote_dir: str = "", quiet: bool = False):
         """Wrapper around SCP."""
-        flags: list[str] = []
+        flags: List[str] = []
         if quiet:
             flags.append("-q")
         scp_cmd = [
@@ -114,7 +114,7 @@ class TestTarget(object):
     """A test target can be the local host, a VM or a remote devica via SSH."""
 
     target_str: str
-    is_host: bool = False
+    is_host: bool = True
     vm: Optional[testvm.Arch] = None
     ssh: Optional[Ssh] = None
     __arch: Optional[Arch] = None
@@ -131,10 +131,12 @@ class TestTarget(object):
             arch: testvm.Arch = parts[1]  # type: ignore
             self.vm = arch
             self.ssh = Ssh("localhost", testvm.ssh_cmd_args(arch))
+            self.is_host = False
         elif len(parts) == 2 and parts[0] == "ssh":
             self.ssh = Ssh(parts[1])
+            self.is_host = False
         elif len(parts) == 1 and parts[0] == "host":
-            self.is_host = True
+            pass
         else:
             raise Exception(f"Invalid target {target_str}")
         if build_arch:
@@ -171,13 +173,13 @@ def find_rust_libs():
     yield from lib_dir.glob("libtest-*")
 
 
-def prepare_remote(ssh: Ssh, extra_files: list[Path] = []):
+def prepare_remote(ssh: Ssh, extra_files: List[Path] = []):
     print("Preparing remote")
     ssh.upload_files(list(find_rust_libs()) + extra_files)
     pass
 
 
-def prepare_target(target: TestTarget, extra_files: list[Path] = []):
+def prepare_target(target: TestTarget, extra_files: List[Path] = []):
     if target.vm:
         testvm.build_if_needed(target.vm)
         testvm.wait(target.vm)
@@ -204,7 +206,7 @@ def get_cargo_build_target(arch: Arch):
 
 def get_cargo_env(target: TestTarget, build_arch: Arch):
     """Environment variables to make cargo use the test target."""
-    env: dict[str, str] = BUILD_ENV.copy()
+    env: Dict[str, str] = BUILD_ENV.copy()
     cargo_target = get_cargo_build_target(build_arch)
     upper_target = cargo_target.upper().replace("-", "_")
     if build_arch != platform.machine():
@@ -215,7 +217,7 @@ def get_cargo_env(target: TestTarget, build_arch: Arch):
     return env
 
 
-def write_envrc(values: dict[str, str]):
+def write_envrc(values: Dict[str, str]):
     with open(ENVRC_PATH, "w") as file:
         for key, value in values.items():
             file.write(f'export {key}="{value}"\n')
@@ -234,8 +236,8 @@ def exec_file_on_target(
     target: TestTarget,
     filepath: Path,
     timeout: int,
-    args: list[str] = [],
-    extra_files: list[Path] = [],
+    args: List[str] = [],
+    extra_files: List[Path] = [],
     **kwargs: Any,
 ):
     """Executes a file on the test target.
@@ -290,9 +292,9 @@ def exec_file_on_target(
 def exec_file(
     target: TestTarget,
     filepath: Path,
-    args: list[str] = [],
+    args: List[str] = [],
     timeout: int = 60,
-    extra_files: list[Path] = [],
+    extra_files: List[Path] = [],
 ):
     if not filepath.exists():
         raise Exception(f"File does not exist: {filepath}")

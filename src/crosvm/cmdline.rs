@@ -66,7 +66,7 @@ pub enum Command {
     #[cfg(feature = "composite-disk")]
     CreateComposite(CreateCompositeCommand),
     CreateQcow2(CreateQcow2Command),
-    Device(DevicesCommand),
+    Device(DeviceCommand),
     Disk(DiskCommand),
     MakeRT(MakeRTCommand),
     Resume(ResumeCommand),
@@ -301,9 +301,9 @@ pub struct VfioCrosvmCommand {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "device")]
 /// Start a device process
-pub struct DevicesCommand {
+pub struct DeviceCommand {
     #[argh(subcommand)]
-    pub command: DevicesSubcommand,
+    pub command: DeviceSubcommand,
 }
 
 #[derive(FromArgs)]
@@ -315,7 +315,7 @@ pub enum CrossPlatformDevicesCommands {
 }
 
 #[derive(argh_helpers::FlattenSubcommand)]
-pub enum DevicesSubcommand {
+pub enum DeviceSubcommand {
     CrossPlatform(CrossPlatformDevicesCommands),
     Sys(super::sys::cmdline::DevicesSubcommand),
 }
@@ -454,7 +454,8 @@ pub struct RunCommand {
     #[cfg(feature = "audio_cras")]
     #[argh(
         option,
-        arg_name = "[capture=true,client=crosvm,socket=unified,num_output_streams=1,num_input_streams=1]",
+        arg_name = "[capture=true,client=crosvm,socket=unified,\
+        num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1]",
         long = "cras-snd"
     )]
     /// comma separated key=value pairs for setting up cras snd
@@ -462,8 +463,12 @@ pub struct RunCommand {
     /// Possible key values:
     ///     capture - Enable audio capture. Default to false.
     ///     client_type - Set specific client type for cras backend.
+    ///     num_output_devices - Set number of output PCM devices.
+    ///     num_input_devices - Set number of input PCM devices.
     ///     num_output_streams - Set number of output PCM streams
+    ///         per device.
     ///     num_input_streams - Set number of input PCM streams
+    ///         per device.
     pub cras_snds: Vec<CrasSndParameters>,
     #[argh(switch)]
     /// don't set VCPUs real-time until make-rt command is run

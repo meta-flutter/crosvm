@@ -13,6 +13,8 @@ use super::platform::GpuRenderServerParameters;
 use super::sys::config::parse_coiommu_params;
 #[cfg(all(feature = "gpu", feature = "virgl_renderer_next"))]
 use super::sys::config::parse_gpu_render_server_options;
+#[cfg(feature = "gpu")]
+use super::sys::config::{parse_gpu_display_options, parse_gpu_options};
 
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use super::config::parse_video_options;
@@ -559,6 +561,11 @@ pub struct RunCommand {
     ///     align - whether to adjust addr and size to page
     ///        boundaries implicitly
     pub file_backed_mappings: Vec<FileBackedMappingParameters>,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[argh(switch)]
+    /// force use of a calibrated TSC cpuid leaf (0x15) even if the hypervisor
+    /// doesn't require one.
+    pub force_calibrated_tsc_leaf: bool,
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
     #[argh(option, arg_name = "PORT")]
     /// (EXPERIMENTAL) gdb on the given port
@@ -646,6 +653,9 @@ pub struct RunCommand {
     #[argh(option, long = "kvm-device", arg_name = "PATH")]
     /// path to the KVM device. (default /dev/kvm)
     pub kvm_device_path: Option<PathBuf>,
+    #[argh(switch)]
+    /// disable host swap on guest VM pages.
+    pub lock_guest_memory: bool,
     #[cfg(unix)]
     #[argh(option, arg_name = "MAC", long = "mac")]
     /// MAC address for VM
@@ -675,10 +685,6 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't use legacy KBD devices emulation
     pub no_i8042: bool,
-    #[cfg(unix)]
-    #[argh(switch)]
-    /// don't use legacy KBD/RTC devices emulation
-    pub no_legacy: bool,
     #[argh(switch)]
     /// don't create RNG device in the guest
     pub no_rng: bool,
@@ -1192,6 +1198,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.hugepages = cmd.hugepages;
 
+        cfg.lock_guest_memory = cmd.lock_guest_memory;
+
         #[cfg(feature = "audio")]
         {
             cfg.ac97_parameters = cmd.ac97;
@@ -1446,9 +1454,6 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(unix)]
         {
-            cfg.no_i8042 = cmd.no_legacy;
-            cfg.no_rtc = cmd.no_legacy;
-
             if cmd.vhost_vsock_device.is_some() && cmd.vhost_vsock_fd.is_some() {
                 return Err(
                     "Only one of vhost-vsock-device vhost-vsock-fd has to be specified".to_string(),
@@ -1554,8 +1559,8 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.force_s2idle = cmd.s2idle;
             cfg.pcie_ecam = cmd.pcie_ecam;
             cfg.pci_low_start = cmd.pci_low_start;
-            cfg.no_i8042 |= cmd.no_i8042;
-            cfg.no_rtc |= cmd.no_rtc;
+            cfg.no_i8042 = cmd.no_i8042;
+            cfg.no_rtc = cmd.no_rtc;
 
             for (index, msr_config) in cmd.userspace_msr {
                 if cfg.userspace_msr.insert(index, msr_config).is_some() {
@@ -1594,7 +1599,20 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.itmt = cmd.itmt;
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if cmd.enable_pnp_data && cmd.force_calibrated_tsc_leaf {
+            return Err(
+                "Only one of [enable_pnp_data,force_calibrated_tsc_leaf] can be specified"
+                    .to_string(),
+            );
+        }
+
         cfg.enable_pnp_data = cmd.enable_pnp_data;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            cfg.force_calibrated_tsc_leaf = cmd.force_calibrated_tsc_leaf;
+        }
 
         cfg.privileged_vm = cmd.privileged_vm;
 

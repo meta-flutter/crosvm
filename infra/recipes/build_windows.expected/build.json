@@ -2,15 +2,23 @@
   {
     "cmd": [
       "vpython3",
-      "[CACHE]/builder/crosvm/tools/dev_container",
-      "--verbose",
       "./tools/run_tests",
       "--verbose",
-      "--build-only",
-      "--target=vm:aarch64",
-      "--build-target=armhf"
+      "--target=host",
+      "--build-only"
     ],
     "cwd": "[CACHE]/builder/crosvm",
+    "env": {
+      "CARGO_HOME": "[CACHE]/crosvm_api/cargo_home",
+      "CARGO_TARGET_DIR": "[CLEANUP]/cargo_target",
+      "RUSTUP_HOME": "[CACHE]/crosvm_api/rustup"
+    },
+    "env_prefixes": {
+      "PATH": [
+        "[CACHE]/crosvm_api/cargo_home/bin",
+        "[CACHE]/crosvm_api/local_bin"
+      ]
+    },
     "luci_context": {
       "realm": {
         "name": "crosvm/crosvm:ci"
@@ -28,14 +36,21 @@
   {
     "cmd": [
       "vpython3",
-      "[CACHE]/builder/crosvm/tools/dev_container",
-      "--verbose",
       "./tools/run_tests",
-      "--verbose",
-      "--target=vm:aarch64",
-      "--build-target=armhf"
+      "--target=host"
     ],
     "cwd": "[CACHE]/builder/crosvm",
+    "env": {
+      "CARGO_HOME": "[CACHE]/crosvm_api/cargo_home",
+      "CARGO_TARGET_DIR": "[CLEANUP]/cargo_target",
+      "RUSTUP_HOME": "[CACHE]/crosvm_api/rustup"
+    },
+    "env_prefixes": {
+      "PATH": [
+        "[CACHE]/crosvm_api/cargo_home/bin",
+        "[CACHE]/crosvm_api/local_bin"
+      ]
+    },
     "luci_context": {
       "realm": {
         "name": "crosvm/crosvm:ci"

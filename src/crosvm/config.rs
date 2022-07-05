@@ -46,7 +46,7 @@ cfg_if::cfg_if! {
         use base::RawDescriptor;
         use devices::virtio::fs::passthrough;
         #[cfg(feature = "gpu")]
-        use crate::crosvm::platform::GpuRenderServerParameters;
+        use crate::crosvm::sys::GpuRenderServerParameters;
         use libc::{getegid, geteuid};
 
         static KVM_PATH: &str = "/dev/kvm";
@@ -308,7 +308,7 @@ impl FromStr for GidMap {
 
 /// Direct IO forwarding options
 #[cfg(feature = "direct")]
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DirectIoOption {
     pub path: PathBuf,
     pub ranges: Vec<BusRange>,
@@ -554,7 +554,7 @@ pub struct FileBackedMappingParameters {
     pub sync: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct HostPcieRootPortParameters {
     pub host_path: PathBuf,
     pub hp_gpe: Option<u32>,

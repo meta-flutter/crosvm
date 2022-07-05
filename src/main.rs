@@ -4,8 +4,6 @@
 
 //! Runs a virtual machine
 
-pub mod panic_hook;
-
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::string::String;
@@ -17,7 +15,7 @@ mod crosvm;
 #[cfg(feature = "plugin")]
 use crosvm::config::executable_is_plugin;
 use crosvm::config::Config;
-use crosvm::{cmdline, platform};
+use crosvm::{cmdline, sys as platform};
 use devices::virtio::vhost::user::device::{run_block_device, run_net_device};
 use disk::QcowFile;
 #[cfg(feature = "composite-disk")]
@@ -32,6 +30,8 @@ use vm_control::{
     },
     BalloonControlCommand, DiskControlCommand, UsbControlResult, VmRequest, VmResponse,
 };
+
+use crosvm::cmdline::{Command, CrossPlatformCommands, CrossPlatformDevicesCommands};
 
 #[cfg(feature = "scudo")]
 #[global_allocator]
@@ -336,8 +336,8 @@ fn create_qcow2(cmd: cmdline::CreateQcow2Command) -> std::result::Result<(), ()>
 fn start_device(opts: cmdline::DeviceCommand) -> std::result::Result<(), ()> {
     let result = match opts.command {
         cmdline::DeviceSubcommand::CrossPlatform(command) => match command {
-            cmdline::CrossPlatformDevicesCommands::Block(cfg) => run_block_device(cfg),
-            cmdline::CrossPlatformDevicesCommands::Net(cfg) => run_net_device(cfg),
+            CrossPlatformDevicesCommands::Block(cfg) => run_block_device(cfg),
+            CrossPlatformDevicesCommands::Net(cfg) => run_net_device(cfg),
         },
         cmdline::DeviceSubcommand::Sys(command) => sys::start_device(command),
     };
@@ -411,7 +411,7 @@ fn pkg_version() -> std::result::Result<(), ()> {
 }
 
 fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
-    panic_hook::set_panic_hook();
+    sys::set_panic_hook();
 
     let mut args: Vec<String> = Vec::default();
     // http://b/235882579
@@ -427,12 +427,10 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
                 eprintln!("Please use `--balloon-bias-mib` instead");
                 args.push("--balloon-bias-mib".to_string());
             }
+            "-h" => args.push("--help".to_string()),
             arg if arg.starts_with("--") => {
+                // Split `--arg=val` into `--arg val`, since argh doesn't support the former.
                 if let Some((key, value)) = arg.split_once("=") {
-                    eprintln!(
-                        "`{}={}` is deprecated, please use `{} {}`",
-                        key, value, key, value
-                    );
                     args.push(key.to_string());
                     args.push(value.to_string());
                 } else {
@@ -473,38 +471,47 @@ fn crosvm_main() -> std::result::Result<CommandStatus, ()> {
         ..Default::default()
     };
 
-    // Past this point, usage of exit is in danger of leaking zombie processes.
-    let ret = if let crosvm::cmdline::Command::Run(cmd) = args.command {
-        // We handle run_vm separately because it does not simply signal success/error
-        // but also indicates whether the guest requested reset or stop.
-        run_vm(cmd, log_config)
-    } else {
-        if let Err(e) = syslog::init_with(log_config) {
-            eprintln!("failed to initialize syslog: {}", e);
-            return Err(());
+    let ret: std::result::Result<CommandStatus, ()> = match args.command {
+        Command::CrossPlatform(command) => {
+            // Past this point, usage of exit is in danger of leaking zombie processes.
+            if let CrossPlatformCommands::Run(cmd) = command {
+                // We handle run_vm separately because it does not simply signal success/error
+                // but also indicates whether the guest requested reset or stop.
+                run_vm(cmd, log_config)
+            } else {
+                if let Err(e) = syslog::init_with(log_config) {
+                    eprintln!("failed to initialize syslog: {}", e);
+                    return Err(());
+                }
+                match command {
+                    CrossPlatformCommands::Balloon(cmd) => balloon_vms(cmd),
+                    CrossPlatformCommands::BalloonStats(cmd) => balloon_stats(cmd),
+                    CrossPlatformCommands::Battery(cmd) => modify_battery(cmd),
+                    #[cfg(feature = "composite-disk")]
+                    CrossPlatformCommands::CreateComposite(cmd) => create_composite(cmd),
+                    CrossPlatformCommands::CreateQcow2(cmd) => create_qcow2(cmd),
+                    CrossPlatformCommands::Device(cmd) => start_device(cmd),
+                    CrossPlatformCommands::Disk(cmd) => disk_cmd(cmd),
+                    CrossPlatformCommands::MakeRT(cmd) => make_rt(cmd),
+                    CrossPlatformCommands::Resume(cmd) => resume_vms(cmd),
+                    CrossPlatformCommands::Run(_) => unreachable!(),
+                    CrossPlatformCommands::Stop(cmd) => stop_vms(cmd),
+                    CrossPlatformCommands::Suspend(cmd) => suspend_vms(cmd),
+                    CrossPlatformCommands::Powerbtn(cmd) => powerbtn_vms(cmd),
+                    CrossPlatformCommands::Sleepbtn(cmd) => sleepbtn_vms(cmd),
+                    CrossPlatformCommands::Gpe(cmd) => inject_gpe(cmd),
+                    CrossPlatformCommands::Usb(cmd) => modify_usb(cmd),
+                    CrossPlatformCommands::Version(_) => pkg_version(),
+                    CrossPlatformCommands::Vfio(cmd) => modify_vfio(cmd),
+                }
+                .map(|_| CommandStatus::Success)
+            }
         }
-        match args.command {
-            cmdline::Command::Balloon(cmd) => balloon_vms(cmd),
-            cmdline::Command::BalloonStats(cmd) => balloon_stats(cmd),
-            cmdline::Command::Battery(cmd) => modify_battery(cmd),
-            #[cfg(feature = "composite-disk")]
-            cmdline::Command::CreateComposite(cmd) => create_composite(cmd),
-            cmdline::Command::CreateQcow2(cmd) => create_qcow2(cmd),
-            cmdline::Command::Device(cmd) => start_device(cmd),
-            cmdline::Command::Disk(cmd) => disk_cmd(cmd),
-            cmdline::Command::MakeRT(cmd) => make_rt(cmd),
-            cmdline::Command::Resume(cmd) => resume_vms(cmd),
-            cmdline::Command::Run(_) => unreachable!(),
-            cmdline::Command::Stop(cmd) => stop_vms(cmd),
-            cmdline::Command::Suspend(cmd) => suspend_vms(cmd),
-            cmdline::Command::Powerbtn(cmd) => powerbtn_vms(cmd),
-            cmdline::Command::Sleepbtn(cmd) => sleepbtn_vms(cmd),
-            cmdline::Command::Gpe(cmd) => inject_gpe(cmd),
-            cmdline::Command::Usb(cmd) => modify_usb(cmd),
-            cmdline::Command::Version(_) => pkg_version(),
-            cmdline::Command::Vfio(cmd) => modify_vfio(cmd),
-        }
-        .map(|_| CommandStatus::Success)
+        cmdline::Command::Sys(command) => sys::run_command(command)
+            .map(|_| CommandStatus::Success)
+            .map_err(|e| {
+                error!("Failed to run command {}", e);
+            }),
     };
 
     sys::cleanup();

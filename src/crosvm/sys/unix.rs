@@ -1,4 +1,4 @@
-// Copyright 2022 The Chromium OS Authors. All rights reserved.,
+// Copyright 2022 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -265,7 +265,7 @@ fn create_virtio_devices(
         .iter()
         .filter(|(_k, v)| v.hardware == SerialHardware::VirtioConsole)
     {
-        let dev = create_console_device(cfg.protected_vm, &cfg.jail_config, param)?;
+        let dev = param.create_virtio_device_and_jail(cfg.protected_vm, &cfg.jail_config)?;
         devs.push(dev);
     }
 

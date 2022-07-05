@@ -12,4 +12,4 @@ cfg_if::cfg_if! {
     }
 }
 
-pub use platform::Doorbell;
+pub use platform::VhostUserListener;

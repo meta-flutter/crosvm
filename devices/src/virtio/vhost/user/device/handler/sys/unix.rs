@@ -3,207 +3,174 @@
 // found in the LICENSE file.
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use base::{clear_fd_flags, error, info, AsRawDescriptor, Event, SafeDescriptor};
+use base::{error, info, AsRawDescriptor, Event, SafeDescriptor};
 use cros_async::{AsyncWrapper, Executor};
 use vm_memory::GuestMemory;
 use vmm_vhost::{
-    connection::{
-        socket::{Endpoint as SocketEndpoint, Listener as SocketListener},
-        vfio::{Endpoint as VfioEndpoint, Listener as VfioListener},
-        Endpoint,
-    },
+    connection::Endpoint,
     message::{MasterReq, VhostUserMemoryRegion},
     Error as VhostError, Protocol, Result as VhostResult, SlaveListener, SlaveReqHandler,
     VhostUserSlaveReqHandler,
 };
 
-use crate::vfio::{VfioDevice, VfioRegionAddr};
-use crate::virtio::interrupt::SignalableInterrupt;
-use crate::virtio::vhost::user::device::handler::{
-    DeviceRequestHandler, Doorbell, GuestAddress, HandlerType, MappingInfo, MemoryRegion,
-};
-use crate::virtio::vhost::user::device::vvu::{
-    device::VvuDevice,
-    doorbell::DoorbellRegion,
-    pci::{VvuPciCaps, VvuPciDevice},
-};
-
-pub(crate) enum HandlerTypeSys {
-    Vvu {
-        vfio_dev: Arc<VfioDevice>,
-        caps: VvuPciCaps,
-        notification_evts: Vec<Event>,
+use crate::{
+    vfio::VfioDevice,
+    virtio::{
+        vhost::user::device::{
+            handler::{
+                CallEvent, DeviceRequestHandler, GuestAddress, MappingInfo, MemoryRegion,
+                VhostUserPlatformOps,
+            },
+            vvu::{
+                doorbell::DoorbellRegion,
+                pci::{VvuPciCaps, VvuPciDevice},
+            },
+        },
+        SignalableInterrupt,
     },
-}
+};
 
-pub enum DoorbellSys {
+/// A Doorbell that supports both regular call events and signaling through a VVU device.
+pub enum Doorbell {
+    Call(CallEvent),
     Vfio(DoorbellRegion),
 }
 
-pub(crate) fn create_vvu_guest_memory(
-    vfio_dev: &VfioDevice,
-    shared_mem_addr: &VfioRegionAddr,
-    contexts: &[VhostUserMemoryRegion],
-) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
-    let file_offset = vfio_dev.get_offset_for_addr(shared_mem_addr).map_err(|e| {
-        error!("failed to get underlying file: {}", e);
-        VhostError::InvalidOperation
-    })?;
-
-    let mut vmm_maps = Vec::with_capacity(contexts.len());
-    let mut regions = Vec::with_capacity(contexts.len());
-    let page_size = base::pagesize() as u64;
-    for region in contexts {
-        let offset = file_offset + region.mmap_offset;
-        assert_eq!(offset % page_size, 0);
-
-        vmm_maps.push(MappingInfo {
-            vmm_addr: region.user_addr as u64,
-            guest_phys: region.guest_phys_addr as u64,
-            size: region.memory_size,
-        });
-
-        let cloned_file = vfio_dev.dev_file().try_clone().map_err(|e| {
-            error!("failed to clone vfio device file: {}", e);
-            VhostError::InvalidOperation
-        })?;
-        let region = MemoryRegion::new_from_file(
-            region.memory_size,
-            GuestAddress(region.guest_phys_addr),
-            file_offset + region.mmap_offset,
-            Arc::new(cloned_file),
-        )
-        .map_err(|e| {
-            error!("failed to create a memory region: {}", e);
-            VhostError::InvalidOperation
-        })?;
-        regions.push(region);
-    }
-
-    let guest_mem = GuestMemory::from_regions(regions).map_err(|e| {
-        error!("failed to create guest memory: {}", e);
-        VhostError::InvalidOperation
-    })?;
-
-    Ok((guest_mem, vmm_maps))
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_protocol(
-    handler_type: &HandlerTypeSys,
-) -> Protocol {
-    match handler_type {
-        HandlerTypeSys::Vvu { .. } => Protocol::Virtio,
+impl From<CallEvent> for Doorbell {
+    fn from(event: CallEvent) -> Self {
+        Doorbell::Call(event)
     }
 }
 
-pub(in crate::virtio::vhost::user::device::handler) fn system_set_mem_table(
-    handler_type_sys: &HandlerTypeSys,
-    files: Vec<File>,
-    contexts: &[VhostUserMemoryRegion],
-) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
-    match handler_type_sys {
-        HandlerTypeSys::Vvu {
-            vfio_dev: device,
-            caps,
-            ..
-        } => {
-            // virtio-vhost-user doesn't pass FDs.
-            if !files.is_empty() {
-                return Err(VhostError::InvalidParam);
-            }
-            Ok(create_vvu_guest_memory(
-                device.as_ref(),
-                caps.shared_mem_cfg_addr(),
-                contexts,
-            )?)
+impl SignalableInterrupt for Doorbell {
+    fn signal(&self, vector: u16, interrupt_status_mask: u32) {
+        match &self {
+            Self::Call(evt) => evt.signal(vector, interrupt_status_mask),
+            Self::Vfio(evt) => evt.signal(vector, interrupt_status_mask),
+        }
+    }
+
+    fn signal_config_changed(&self) {
+        match &self {
+            Self::Call(evt) => evt.signal_config_changed(),
+            Self::Vfio(evt) => evt.signal_config_changed(),
+        }
+    }
+
+    fn get_resample_evt(&self) -> Option<&Event> {
+        match &self {
+            Self::Call(evt) => evt.get_resample_evt(),
+            Self::Vfio(evt) => evt.get_resample_evt(),
+        }
+    }
+
+    fn do_interrupt_resample(&self) {
+        match &self {
+            Self::Call(evt) => evt.do_interrupt_resample(),
+            Self::Vfio(evt) => evt.do_interrupt_resample(),
         }
     }
 }
 
-pub(in crate::virtio::vhost::user::device::handler) fn system_get_kick_evt(
-    handler_type_sys: &HandlerTypeSys,
-    index: u8,
-    file: Option<File>,
-) -> VhostResult<Event> {
-    match handler_type_sys {
-        HandlerTypeSys::Vvu {
-            notification_evts, ..
-        } => {
-            if file.is_some() {
-                return Err(VhostError::InvalidParam);
-            }
-            Ok(notification_evts[index as usize].try_clone().map_err(|e| {
+/// Ops for running vhost-user over virtio (i.e. virtio-vhost-user).
+pub struct VvuOps {
+    vfio_dev: Arc<VfioDevice>,
+    caps: VvuPciCaps,
+    notification_evts: Vec<Event>,
+}
+
+impl VvuOps {
+    pub fn new(device: &mut VvuPciDevice) -> Self {
+        Self {
+            vfio_dev: Arc::clone(&device.vfio_dev),
+            caps: device.caps.clone(),
+            notification_evts: std::mem::take(&mut device.notification_evts),
+        }
+    }
+}
+
+impl VhostUserPlatformOps for VvuOps {
+    fn protocol(&self) -> Protocol {
+        return Protocol::Virtio;
+    }
+
+    fn set_mem_table(
+        &mut self,
+        contexts: &[VhostUserMemoryRegion],
+        files: Vec<File>,
+    ) -> VhostResult<(GuestMemory, Vec<MappingInfo>)> {
+        // virtio-vhost-user doesn't pass FDs.
+        if !files.is_empty() {
+            return Err(VhostError::InvalidParam);
+        }
+
+        let file_offset = self
+            .vfio_dev
+            .get_offset_for_addr(self.caps.shared_mem_cfg_addr())
+            .map_err(|e| {
+                error!("failed to get underlying file: {}", e);
+                VhostError::InvalidOperation
+            })?;
+
+        let mut vmm_maps = Vec::with_capacity(contexts.len());
+        let mut regions = Vec::with_capacity(contexts.len());
+        let page_size = base::pagesize() as u64;
+        for region in contexts {
+            let offset = file_offset + region.mmap_offset;
+            assert_eq!(offset % page_size, 0);
+
+            vmm_maps.push(MappingInfo {
+                vmm_addr: region.user_addr as u64,
+                guest_phys: region.guest_phys_addr as u64,
+                size: region.memory_size,
+            });
+
+            let cloned_file = self.vfio_dev.dev_file().try_clone().map_err(|e| {
+                error!("failed to clone vfio device file: {}", e);
+                VhostError::InvalidOperation
+            })?;
+            let region = MemoryRegion::new_from_file(
+                region.memory_size,
+                GuestAddress(region.guest_phys_addr),
+                file_offset + region.mmap_offset,
+                Arc::new(cloned_file),
+            )
+            .map_err(|e| {
+                error!("failed to create a memory region: {}", e);
+                VhostError::InvalidOperation
+            })?;
+            regions.push(region);
+        }
+
+        let guest_mem = GuestMemory::from_regions(regions).map_err(|e| {
+            error!("failed to create guest memory: {}", e);
+            VhostError::InvalidOperation
+        })?;
+
+        Ok((guest_mem, vmm_maps))
+    }
+
+    fn set_vring_kick(&mut self, index: u8, file: Option<File>) -> VhostResult<Event> {
+        if file.is_some() {
+            return Err(VhostError::InvalidParam);
+        }
+        self.notification_evts[index as usize]
+            .try_clone()
+            .map_err(|e| {
                 error!("failed to clone notification_evts[{}]: {}", index, e);
                 VhostError::InvalidOperation
-            })?)
+            })
+    }
+
+    fn set_vring_call(&mut self, index: u8, file: Option<File>) -> VhostResult<Doorbell> {
+        if file.is_some() {
+            return Err(VhostError::InvalidParam);
         }
-    }
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_create_doorbell(
-    handler_type_sys: &HandlerTypeSys,
-    index: u8,
-) -> VhostResult<Doorbell> {
-    match handler_type_sys {
-        HandlerTypeSys::Vvu {
-            vfio_dev: device,
-            caps,
-            ..
-        } => {
-            let doorbell = DoorbellRegion::new(index as u8, device, caps)?;
-            Ok(Doorbell::SystemDoorbell(DoorbellSys::Vfio(doorbell)))
-        }
-    }
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_clear_rd_flags(
-    file: &File,
-) -> VhostResult<()> {
-    // Remove O_NONBLOCK from kick_fd. Otherwise, uring_executor will fails when we read
-    // values via `next_val()` later.
-    if let Err(e) = clear_fd_flags(file.as_raw_fd(), libc::O_NONBLOCK) {
-        error!("failed to remove O_NONBLOCK for kick fd: {}", e);
-        return Err(VhostError::InvalidParam);
-    }
-    Ok(())
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_signal_config_changed(
-    doorbell_sys: &DoorbellSys,
-) {
-    match doorbell_sys {
-        DoorbellSys::Vfio(evt) => evt.signal_config_changed(),
-    }
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_get_resample_evt(
-    doorbell_sys: &DoorbellSys,
-) -> Option<&Event> {
-    match doorbell_sys {
-        DoorbellSys::Vfio(evt) => evt.get_resample_evt(),
-    }
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_do_interrupt_resample(
-    doorbell_sys: &DoorbellSys,
-) {
-    match doorbell_sys {
-        DoorbellSys::Vfio(evt) => evt.do_interrupt_resample(),
-    }
-}
-
-pub(in crate::virtio::vhost::user::device::handler) fn system_signal(
-    doorbell_sys: &DoorbellSys,
-    vector: u16,
-    interrupt_status_mask: u32,
-) {
-    match doorbell_sys {
-        DoorbellSys::Vfio(evt) => evt.signal(vector, interrupt_status_mask),
+        let doorbell = DoorbellRegion::new(index as u8, &self.vfio_dev, &self.caps)?;
+        Ok(Doorbell::Vfio(doorbell))
     }
 }
 
@@ -239,19 +206,10 @@ where
     }
 }
 
-impl DeviceRequestHandler {
-    /// Creates a listening socket at `socket` and handles incoming messages from the VMM, which are
-    /// dispatched to the device backend via the `VhostUserBackend` trait methods.
-    pub async fn run<P: AsRef<Path>>(self, socket: P, ex: &Executor) -> Result<()> {
-        let listener = SocketListener::new(socket, true /* unlink */)
-            .context("failed to create a socket listener")?;
-        self.run_with_listener::<SocketEndpoint<_>>(listener, ex)
-            .await
-    }
-
+impl<O: VhostUserPlatformOps> DeviceRequestHandler<O> {
     /// Attaches to an already bound socket via `listener` and handles incoming messages from the
     /// VMM, which are dispatched to the device backend via the `VhostUserBackend` trait methods.
-    pub async fn run_with_listener<E>(self, listener: E::Listener, ex: &Executor) -> Result<()>
+    pub async fn run_with_listener<E>(self, listener: E::Listener, ex: Executor) -> Result<()>
     where
         E: Endpoint<MasterReq> + AsRawDescriptor,
         E::Listener: AsRawDescriptor,
@@ -267,7 +225,7 @@ impl DeviceRequestHandler {
                 .accept()
                 .context("failed to accept an incoming connection")?
             {
-                Some(req_handler) => return run_handler(req_handler, ex).await,
+                Some(req_handler) => return run_handler(req_handler, &ex).await,
                 None => {
                     // Nobody is on the other end yet, wait until we get a connection.
                     let async_waiter = ex
@@ -280,20 +238,6 @@ impl DeviceRequestHandler {
                 }
             }
         }
-    }
-
-    /// Starts listening virtio-vhost-user device with VFIO to handle incoming vhost-user messages
-    /// forwarded by it.
-    pub async fn run_vvu(mut self, mut device: VvuPciDevice, ex: &Executor) -> Result<()> {
-        self.handler_type = HandlerType::SystemHandlerType(HandlerTypeSys::Vvu {
-            vfio_dev: Arc::clone(&device.vfio_dev),
-            caps: device.caps.clone(),
-            notification_evts: std::mem::take(&mut device.notification_evts),
-        });
-
-        let listener = VfioListener::new(VvuDevice::new(device))?;
-        self.run_with_listener::<VfioEndpoint<_, _>>(listener, ex)
-            .await
     }
 }
 
@@ -358,8 +302,10 @@ mod tests {
         });
 
         // Device side
-        let handler =
-            std::sync::Mutex::new(DeviceRequestHandler::new(Box::new(FakeBackend::new())));
+        let handler = std::sync::Mutex::new(DeviceRequestHandler::new_with_ops(
+            Box::new(FakeBackend::new()),
+            VhostUserRegularOps,
+        ));
         let mut listener = SlaveListener::<SocketEndpoint<_>, _>::new(listener, handler).unwrap();
 
         // Notify listener is ready.

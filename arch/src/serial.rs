@@ -117,11 +117,12 @@ impl SerialInput {
 ///
 /// # Arguments
 ///
+/// * `protected_vm` - VM protection mode.
 /// * `io_bus` - Bus to add the devices to
 /// * `com_evt_1_3` - event for com1 and com3
 /// * `com_evt_1_4` - event for com2 and com4
-/// * `io_bus` - Bus to add the devices to
 /// * `serial_parameters` - definitions of serial parameter configurations.
+/// * `serial_jail` - minijail object cloned for use with each serial device.
 ///   All four of the traditional PC-style serial ports (COM1-COM4) must be specified.
 pub fn add_serial_devices(
     protected_vm: ProtectionType,
@@ -153,8 +154,14 @@ pub fn add_serial_devices(
             #[cfg(unix)]
             Some(jail) => {
                 let com = Arc::new(Mutex::new(
-                    ProxyDevice::new(com, jail, preserved_descriptors)
-                        .map_err(DeviceRegistrationError::ProxyDeviceCreation)?,
+                    ProxyDevice::new(
+                        com,
+                        &jail
+                            .try_clone()
+                            .map_err(DeviceRegistrationError::CloneJail)?,
+                        preserved_descriptors,
+                    )
+                    .map_err(DeviceRegistrationError::ProxyDeviceCreation)?,
                 ));
                 io_bus
                     .insert(com.clone(), SERIAL_ADDR[x as usize], 0x8)

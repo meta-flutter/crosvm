@@ -16,21 +16,28 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(unix)]
 use libc::sched_getcpu;
 
 use acpi_tables::aml::Aml;
 use acpi_tables::sdt::SDT;
 use base::{syslog, AsRawDescriptor, AsRawDescriptors, Event, SendTube, Tube};
 use devices::virtio::VirtioDevice;
+#[cfg(windows)]
+use devices::Minijail;
 use devices::{
     BarRange, Bus, BusDevice, BusDeviceObj, BusError, BusResumeDevice, HotPlugBus, IrqChip,
     IrqEventSource, PciAddress, PciBus, PciDevice, PciDeviceError, PciInterruptPin, PciRoot,
-    ProxyDevice, SerialHardware, SerialParameters, VfioPlatformDevice,
+    SerialHardware, SerialParameters,
 };
+#[cfg(unix)]
+use devices::{ProxyDevice, VfioPlatformDevice};
 use hypervisor::{IoEventAddress, ProtectionType, Vm};
+#[cfg(unix)]
 use minijail::Minijail;
 use remain::sorted;
 use resources::{MmioType, SystemAllocator, SystemAllocatorConfig};
+use serde::{Deserialize, Serialize};
 use sync::Mutex;
 use thiserror::Error;
 use vm_control::{BatControl, BatteryType, PmResource};
@@ -67,14 +74,14 @@ pub enum VmImage {
     Bios(File),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Pstore {
     pub path: PathBuf,
     pub size: u32,
 }
 
 /// Mapping of guest VCPU threads to host CPU cores.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum VcpuAffinity {
     /// All VCPU threads will be pinned to the same set of host CPU cores.
     Global(Vec<usize>),
@@ -148,7 +155,6 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub suspend_evt: Event,
     pub vcpu_affinity: Option<VcpuAffinity>,
     pub vcpu_count: usize,
-    /// Per-VCPU initialization data, indexed by vcpu_id.
     pub vcpu_init: Vec<VcpuInitArch>,
     /// If vcpus is None, then it's the responsibility of the vcpu thread to create vcpus.
     /// If it's Some, then `build_vm` already created the vcpus.
@@ -260,7 +266,7 @@ pub trait LinuxArch {
     fn register_pci_device<V: VmArch, Vcpu: VcpuArch>(
         linux: &mut RunnableLinuxVm<V, Vcpu>,
         device: Box<dyn PciDevice>,
-        minijail: Option<Minijail>,
+        #[cfg(unix)] minijail: Option<Minijail>,
         resources: &mut SystemAllocator,
     ) -> Result<PciAddress, Self::Error>;
 
@@ -322,12 +328,14 @@ pub enum DeviceRegistrationError {
     #[error("Allocating IRQ number")]
     AllocateIrq,
     /// Could not allocate IRQ resource for the device.
+    #[cfg(unix)]
     #[error("Allocating IRQ resource: {0}")]
     AllocateIrqResource(devices::vfio::VfioError),
     /// Broken pci topology
     #[error("pci topology is broken")]
     BrokenPciTopology,
     /// Unable to clone a jail for the device.
+    #[cfg(unix)]
     #[error("failed to clone jail: {0}")]
     CloneJail(minijail::Error),
     /// Appending to kernel command line failed.
@@ -360,6 +368,7 @@ pub enum DeviceRegistrationError {
     /// Could not add a device to the mmio bus.
     #[error("failed to add to mmio bus: {0}")]
     MmioInsert(BusError),
+    #[cfg(unix)]
     /// Failed to initialize proxy device for jailed device.
     #[error("failed to create proxy device: {0}")]
     ProxyDeviceCreation(devices::ProxyError),
@@ -384,7 +393,7 @@ pub enum DeviceRegistrationError {
 pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     mut device: Box<dyn PciDevice>,
-    jail: Option<Minijail>,
+    #[cfg(unix)] jail: Option<Minijail>,
     resources: &mut SystemAllocator,
 ) -> Result<PciAddress, DeviceRegistrationError> {
     // Allocate PCI device address before allocating BARs.
@@ -429,6 +438,8 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
             .map_err(DeviceRegistrationError::RegisterIoevent)?;
         keep_rds.push(event.as_raw_descriptor());
     }
+
+    #[cfg(unix)]
     let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {
         let proxy = ProxyDevice::new(device, &jail, keep_rds)
             .map_err(DeviceRegistrationError::ProxyDeviceCreation)?;
@@ -441,6 +452,13 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
         Arc::new(Mutex::new(device))
     };
 
+    #[cfg(windows)]
+    let arced_dev = {
+        device.on_sandboxed();
+        Arc::new(Mutex::new(device))
+    };
+
+    #[cfg(unix)]
     linux
         .root_config
         .lock()
@@ -464,6 +482,7 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
 }
 
 /// Creates a platform device for use by this Vm.
+#[cfg(unix)]
 pub fn generate_platform_bus(
     devices: Vec<(VfioPlatformDevice, Option<Minijail>)>,
     irq_chip: &mut dyn IrqChip,
@@ -655,6 +674,7 @@ pub fn generate_pci_root(
     )?;
 
     let mut root = PciRoot::new(Arc::downgrade(&mmio_bus), Arc::downgrade(&io_bus), root_bus);
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut pid_labels = BTreeMap::new();
 
     // Allocate legacy INTx
@@ -691,7 +711,8 @@ pub fn generate_pci_root(
 
     // To prevent issues where device's on_sandbox may spawn thread before all
     // sandboxed devices are sandboxed we partition iterator to go over sandboxed
-    // first
+    // first. This is needed on linux platforms. On windows, this is a no-op since
+    // jails are always None, even for sandboxed devices.
     let devices = {
         let (sandboxed, non_sandboxed): (Vec<_>, Vec<_>) = devices
             .into_iter()
@@ -699,8 +720,11 @@ pub fn generate_pci_root(
             .partition(|(_, (_, jail))| jail.is_some());
         sandboxed.into_iter().chain(non_sandboxed.into_iter())
     };
-
-    for (dev_idx, (mut device, jail)) in devices {
+    for (dev_idx, dev_value) in devices {
+        #[cfg(unix)]
+        let (mut device, jail) = dev_value;
+        #[cfg(windows)]
+        let (mut device, _) = dev_value;
         let address = device_addrs[dev_idx];
 
         let mut keep_rds = device.keep_rds();
@@ -719,12 +743,18 @@ pub fn generate_pci_root(
             keep_rds.push(event.as_raw_descriptor());
         }
 
+        #[cfg(unix)]
         let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {
             let proxy = ProxyDevice::new(device, &jail, keep_rds)
                 .map_err(DeviceRegistrationError::ProxyDeviceCreation)?;
             pid_labels.insert(proxy.pid() as u32, proxy.debug_label());
             Arc::new(Mutex::new(proxy))
         } else {
+            device.on_sandboxed();
+            Arc::new(Mutex::new(device))
+        };
+        #[cfg(windows)]
+        let arced_dev = {
             device.on_sandboxed();
             Arc::new(Mutex::new(device))
         };
@@ -782,7 +812,7 @@ pub fn add_goldfish_battery(
     let create_monitor = Some(Box::new(power_monitor::powerd::DBusMonitor::connect)
         as Box<dyn power_monitor::CreatePowerMonitorFn>);
 
-    #[cfg(not(feature = "power-monitor-powerd"))]
+    #[cfg(all(not(feature = "power-monitor-powerd"), unix))]
     let create_monitor = None;
 
     let irq_evt = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
@@ -794,6 +824,7 @@ pub fn add_goldfish_battery(
             .try_clone()
             .map_err(DeviceRegistrationError::EventClone)?,
         response_tube,
+        #[cfg(unix)]
         create_monitor,
     )
     .map_err(DeviceRegistrationError::RegisterBattery)?;
@@ -808,6 +839,7 @@ pub fn add_goldfish_battery(
         .map_err(DeviceRegistrationError::RegisterIrqfd)?;
 
     match battery_jail.as_ref() {
+        #[cfg(not(windows))]
         Some(jail) => {
             let mut keep_rds = goldfish_bat.keep_rds();
             syslog::push_descriptors(&mut keep_rds);
@@ -822,6 +854,8 @@ pub fn add_goldfish_battery(
                 )
                 .map_err(DeviceRegistrationError::MmioInsert)?;
         }
+        #[cfg(windows)]
+        Some(_) => {}
         None => {
             mmio_bus
                 .insert(
@@ -943,7 +977,7 @@ where
 /// Read and write permissions setting
 ///
 /// Wrap read_allow and write_allow to store them in MsrHandlers level.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum MsrRWType {
     ReadOnly,
     WriteOnly,
@@ -951,7 +985,7 @@ pub enum MsrRWType {
 }
 
 /// Handler types for userspace-msr
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum MsrAction {
     /// Read and write from host directly, and the control of MSR will
     /// take effect on host.
@@ -964,7 +998,7 @@ pub enum MsrAction {
 /// Source CPU of MSR value
 ///
 /// Indicate which CPU that user get/set MSRs from/to.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum MsrValueFrom {
     /// Read/write MSR value from/into CPU 0.
     /// The MSR source CPU always be CPU 0.
@@ -979,6 +1013,11 @@ impl MsrValueFrom {
     pub fn get_cpu_id(&self) -> usize {
         match self {
             MsrValueFrom::RWFromCPU0 => 0,
+            #[cfg(windows)]
+            MsrValueFrom::RWFromRunningCPU => {
+                unimplemented!();
+            }
+            #[cfg(unix)]
             MsrValueFrom::RWFromRunningCPU => {
                 // Safe because the host supports this sys call.
                 (unsafe { sched_getcpu() }) as usize
@@ -988,7 +1027,7 @@ impl MsrValueFrom {
 }
 
 /// Whether to force KVM-filtered MSRs.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum MsrFilter {
     /// Leave it to hypervisor (KVM) default.
     Default,
@@ -1001,7 +1040,7 @@ pub enum MsrFilter {
 ///
 /// MsrConfig will be collected with its corresponding MSR's index.
 /// eg, (msr_index, msr_config)
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MsrConfig {
     /// If support RDMSR/WRMSR emulation in crosvm?
     pub rw_type: MsrRWType,

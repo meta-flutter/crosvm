@@ -10,13 +10,19 @@ mod bus;
 mod irq_event;
 pub mod irqchip;
 mod pci;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod pit;
 pub mod serial_device;
 mod sys;
 pub mod virtio;
 #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
 mod vtpm_proxy;
+
+cfg_if::cfg_if! {
+    if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+        mod pit;
+        pub use self::pit::{Pit, PitError};
+        pub mod tsc;
+    }
+}
 
 pub use self::bus::{
     Bus, BusAccessInfo, BusDevice, BusDeviceObj, BusDeviceSync, BusRange, BusResumeDevice, BusType,
@@ -30,8 +36,6 @@ pub use self::pci::{
     PciDeviceError, PciInterruptPin, PciRoot, PciVirtualConfigMmio, StubPciDevice,
     StubPciParameters,
 };
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub use self::pit::{Pit, PitError};
 #[cfg(all(feature = "tpm", feature = "chromeos", target_arch = "x86_64"))]
 pub use self::vtpm_proxy::VtpmProxy;
 
@@ -56,8 +60,6 @@ cfg_if::cfg_if! {
         mod serial;
         #[cfg(feature = "tpm")]
         mod software_tpm;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        pub mod tsc;
         #[cfg(feature = "usb")]
         pub mod usb;
         #[cfg(feature = "usb")]
@@ -139,6 +141,11 @@ cfg_if::cfg_if! {
             }
         }
     } else if #[cfg(windows)] {
+        // We define Minijail as an empty struct on Windows because the concept
+        // of jailing is baked into a bunch of places where it isn't easy
+        // to compile it out. In the long term, this should go away.
+        #[cfg(windows)]
+        pub struct Minijail {}
     } else {
         compile_error!("Unsupported platform");
     }

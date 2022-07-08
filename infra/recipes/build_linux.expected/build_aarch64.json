@@ -10,6 +10,9 @@
       "--target=vm:aarch64"
     ],
     "cwd": "[CACHE]/builder/crosvm",
+    "env": {
+      "CROSVM_CONTAINER_CACHE": "[CACHE]/builder/dev_container"
+    },
     "luci_context": {
       "realm": {
         "name": "crosvm/crosvm:ci"
@@ -31,9 +34,13 @@
       "--verbose",
       "./tools/run_tests",
       "--verbose",
+      "--repeat=1",
       "--target=vm:aarch64"
     ],
     "cwd": "[CACHE]/builder/crosvm",
+    "env": {
+      "CROSVM_CONTAINER_CACHE": "[CACHE]/builder/dev_container"
+    },
     "luci_context": {
       "realm": {
         "name": "crosvm/crosvm:ci"

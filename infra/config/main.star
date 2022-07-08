@@ -137,7 +137,32 @@ luci.list_view(
     name = "Infra",
 )
 
-def verify_builder(name, dimensions, presubmit = True, postsubmit = True, category = "generic", **args):
+# Allows builders to send email notifications on failures.
+luci.notifier(
+    name = "postsubmit-failures",
+    on_status_change = True,
+    notify_emails = [
+        "denniskempin@google.com",
+    ],
+)
+luci.notifier(
+    name = "infra-failures",
+    on_status_change = True,
+    notify_emails = [
+        "denniskempin@google.com",
+    ],
+)
+
+def verify_builder(
+        name,
+        dimensions,
+        presubmit = True,
+        postsubmit = True,
+        properties = dict(),
+        presubmit_properties = dict(),
+        postsubmit_properties = dict(),
+        category = "generic",
+        **args):
     """Creates both a CI and try builder with the same properties.
 
     The CI builder is attached to the gitlies poller and console view, and the try builder
@@ -149,16 +174,23 @@ def verify_builder(name, dimensions, presubmit = True, postsubmit = True, catego
         presubmit: Create a presubmit builder (defaults to True)
         postsubmit: Create a postsubmit builder (defaults to True)
         category: Category of this builder in the concole view
+        properties: Builder properties for both presubmit and postsubmit
+        presubmit_properties: Builder properties for only presubmit
+        postsubmit_properties: Builder properties for only postsubmit
         **args: Passed to luci.builder
     """
 
     # CI builder
     if postsubmit:
+        props = dict(**properties)
+        props.update(postsubmit_properties)
         luci.builder(
             name = name,
             bucket = "ci",
             service_account = "crosvm-luci-ci-builder@crosvm-infra.iam.gserviceaccount.com",
             dimensions = dict(pool = "luci.crosvm.ci", **dimensions),
+            notifies = ["postsubmit-failures"],
+            properties = props,
             **args
         )
         luci.gitiles_poller(
@@ -175,11 +207,14 @@ def verify_builder(name, dimensions, presubmit = True, postsubmit = True, catego
 
     # Try builder
     if presubmit:
+        props = dict(**properties)
+        props.update(presubmit_properties)
         luci.builder(
             name = name,
             bucket = "try",
             service_account = "crosvm-luci-try-builder@crosvm-infra.iam.gserviceaccount.com",
             dimensions = dict(pool = "luci.crosvm.try", **dimensions),
+            properties = props,
             **args
         )
 
@@ -213,6 +248,12 @@ def verify_linux_builder(arch, crosvm_direct = False, **kwargs):
             "test_arch": arch,
             "crosvm_direct": crosvm_direct,
         },
+        postsubmit_properties = {
+            "repeat_tests": 10,
+        },
+        caches = [
+            swarming.cache("builder", name = "linux_builder_cache"),
+        ],
         category = "linux",
         **kwargs
     )
@@ -259,6 +300,7 @@ def infra_builder(name, postsubmit, **args):
             "os": "Ubuntu",
             "cpu": "x86-64",
         },
+        notifies = ["infra-failures"],
         **args
     )
     if postsubmit:
@@ -302,6 +344,9 @@ verify_builder(
     executable = luci.recipe(
         name = "health_check",
     ),
+    caches = [
+        swarming.cache("builder", name = "linux_builder_cache"),
+    ],
     category = "linux",
 )
 

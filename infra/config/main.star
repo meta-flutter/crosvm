@@ -249,7 +249,10 @@ def verify_linux_builder(arch, crosvm_direct = False, **kwargs):
             "crosvm_direct": crosvm_direct,
         },
         postsubmit_properties = {
-            "repeat_tests": 10,
+            "repeat_tests": 3,
+        },
+        presubmit_properties = {
+            "retry_tests": 2,
         },
         caches = [
             swarming.cache("builder", name = "linux_builder_cache"),
@@ -354,6 +357,14 @@ infra_builder(
     name = "push_to_github",
     executable = luci.recipe(
         name = "push_to_github",
+    ),
+    postsubmit = True,
+)
+
+infra_builder(
+    name = "build_docs",
+    executable = luci.recipe(
+        name = "build_docs",
     ),
     postsubmit = True,
 )

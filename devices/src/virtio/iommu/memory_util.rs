@@ -9,21 +9,21 @@ use std::sync::Arc;
 use sync::Mutex;
 
 use anyhow::{bail, Context};
+use base::Protection;
 use data_model::DataInit;
 use vm_memory::{GuestAddress, GuestMemory};
 
 use crate::virtio::iommu::IpcMemoryMapper;
-use crate::virtio::memory_mapper::{Permission, Translate};
 
 /// A wrapper that works with gpa, or iova and an iommu.
-pub fn is_valid_wrapper<T: Translate>(
+pub fn is_valid_wrapper(
     mem: &GuestMemory,
-    iommu: &Option<T>,
+    iommu: &Option<Arc<Mutex<IpcMemoryMapper>>>,
     addr: GuestAddress,
     size: u64,
 ) -> anyhow::Result<bool> {
     if let Some(iommu) = iommu {
-        is_valid(mem, iommu, addr.offset(), size)
+        is_valid(mem, &iommu.lock(), addr.offset(), size)
     } else {
         Ok(addr
             .checked_add(size as u64)
@@ -33,9 +33,9 @@ pub fn is_valid_wrapper<T: Translate>(
 
 /// Translates `iova` into gpa regions (or 1 gpa region when it is contiguous), and check if the
 /// gpa regions are all valid in `mem`.
-pub fn is_valid<T: Translate>(
+pub fn is_valid(
     mem: &GuestMemory,
-    iommu: &T,
+    iommu: &IpcMemoryMapper,
     iova: u64,
     size: u64,
 ) -> anyhow::Result<bool> {
@@ -83,7 +83,7 @@ pub fn read_obj_from_addr<T: DataInit>(
     let mut buf = vec![0u8; std::mem::size_of::<T>()];
     let mut addr: usize = 0;
     for r in regions {
-        if (r.perm as u8 & Permission::Read as u8) == 0 {
+        if !r.prot.allows(&Protection::read()) {
             bail!("gpa is not readable");
         }
         mem.read_at_addr(&mut buf[addr..(addr + r.len as usize)], r.gpa)
@@ -126,7 +126,7 @@ pub fn write_obj_at_addr<T: DataInit>(
     let buf = val.as_slice();
     let mut addr: usize = 0;
     for r in regions {
-        if (r.perm as u8 & Permission::Read as u8) == 0 {
+        if !r.prot.allows(&Protection::write()) {
             bail!("gpa is not writable");
         }
         mem.write_at_addr(&buf[addr..(addr + (r.len as usize))], r.gpa)

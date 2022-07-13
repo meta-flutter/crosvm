@@ -4,15 +4,11 @@
 
 //! Provide utility to communicate with an iommu in another process
 
-use std::ops::Deref;
-use std::result;
-
+use anyhow::{Context, Result};
 use base::{AsRawDescriptor, AsRawDescriptors, RawDescriptor, Tube};
 use serde::{Deserialize, Serialize};
 
-use crate::virtio::memory_mapper::{Error, MemRegion, Translate};
-
-pub type Result<T> = result::Result<T, Error>;
+use crate::virtio::memory_mapper::MemRegion;
 
 #[derive(Serialize, Deserialize)]
 pub struct TranslateRequest {
@@ -44,18 +40,19 @@ impl IpcMemoryMapper {
             endpoint_id,
         }
     }
-}
 
-impl Translate for IpcMemoryMapper {
-    fn translate(&self, iova: u64, size: u64) -> Result<Vec<MemRegion>> {
+    pub fn translate(&self, iova: u64, size: u64) -> Result<Vec<MemRegion>> {
         let req = TranslateRequest {
             endpoint_id: self.endpoint_id,
             iova,
             size,
         };
-        self.request_tx.send(&req).map_err(Error::Tube)?;
-        let res: Option<Vec<MemRegion>> = self.response_rx.recv().map_err(Error::Tube)?;
-        res.ok_or(Error::InvalidIOVA(iova, size))
+        self.request_tx
+            .send(&req)
+            .context("error sending request")?;
+        let res: Option<Vec<MemRegion>> =
+            self.response_rx.recv().context("error receiving reply")?;
+        res.context(format!("invalid iova {:x} {:x}", iova, size))
     }
 }
 
@@ -65,12 +62,6 @@ impl AsRawDescriptors for IpcMemoryMapper {
             self.request_tx.as_raw_descriptor(),
             self.response_rx.as_raw_descriptor(),
         ]
-    }
-}
-
-impl Translate for std::sync::MutexGuard<'_, IpcMemoryMapper> {
-    fn translate(&self, iova: u64, size: u64) -> Result<Vec<MemRegion>> {
-        self.deref().translate(iova, size)
     }
 }
 
@@ -99,7 +90,7 @@ pub fn create_ipc_mapper(endpoint_id: u32, request_tx: Tube) -> CreateIpcMapperR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::memory_mapper::Permission;
+    use base::Protection;
     use std::thread;
     use vm_memory::GuestAddress;
 
@@ -118,7 +109,7 @@ mod tests {
                 .zip(&vec![MemRegion {
                     gpa: GuestAddress(0x777),
                     len: 1,
-                    perm: Permission::RW,
+                    prot: Protection::read_write(),
                 },])
                 .all(|(a, b)| a == b));
         });
@@ -135,7 +126,7 @@ mod tests {
                 .send(&Some(vec![MemRegion {
                     gpa: GuestAddress(0x777),
                     len: 1,
-                    perm: Permission::RW,
+                    prot: Protection::read_write(),
                 }]))
                 .unwrap();
             // This join needs to be here because on Windows, if `response_tx`
